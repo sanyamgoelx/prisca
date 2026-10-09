@@ -1,0 +1,49 @@
+# Publishes a release when a version tag is pushed (release.cmd does that):
+# builds the Windows installer, uploads it to a GitHub Release, and writes
+# latest.json, which installed copies read to update themselves. Signed for
+# the updater with TAURI_SIGNING_PRIVATE_KEY (set up once by release-setup.cmd).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: windows
+          save-if: false
+      - name: Install JS dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Prisca ${{ github.ref_name }}"
+          releaseBody: |
+            Fast scanning for any scanner or all-in-one printer on Windows. Press Space to scan; pages are cropped and straightened automatically; save as PDF (searchable), JPG or PNG; print or copy.
+
+            **Download:** `Prisca_…_x64-setup.exe`. Installed copies update themselves.
+
+            **First launch:** Windows may say "Windows protected your PC": click *More info* › *Run anyway*.
+          releaseDraft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          updaterJsonPreferNsis: true

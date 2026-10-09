@@ -1,0 +1,16 @@
+{
+  "name": "prisca",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prisca: fast scanning for any WIA scanner or all-in-one printer",
+  "author": "Crofty",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  }
+}

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prisca</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f2b544" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"></path><path d="M20 8V5.5A1.5 1.5 0 0 0 18.5 4H16"></path><path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20H8"></path><path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"></path><path d="M3 12h18"></path></svg>
+      <span>Prisca</span>
+    </div>
+    <div class="presets" id="presets" role="radiogroup" aria-label="Scan preset"></div>
+    <label class="mini-select" title="Scan resolution">
+      <span class="sr">Resolution</span>
+      <select id="dpi"></select>
+    </label>
+    <label class="mini-select" id="sourceWrap" hidden title="Where the paper is">
+      <span class="sr">Source</span>
+      <select id="source">
+        <option value="flatbed">Glass</option>
+        <option value="feeder">Feeder</option>
+      </select>
+    </label>
+    <div class="spacer"></div>
+    <button class="device" id="deviceBtn" aria-haspopup="listbox">
+      <span class="dot" id="deviceDot"></span>
+      <span id="deviceText">Looking for scanners…</span>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
+    </button>
+    <div class="menu" id="deviceMenu" hidden role="listbox"></div>
+  </header>
+
+  <main class="body">
+    <aside class="batch">
+      <div class="batch-head"><span>This batch</span><span class="mono" id="pageCount">0 pages</span></div>
+      <div class="thumbs" id="thumbs"></div>
+      <button class="add-pictures" id="importBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+        Add pictures
+      </button>
+    </aside>
+
+    <section class="stage">
+      <div class="toolbar" id="toolbar">
+        <button class="icon-btn" id="rotL" aria-label="Turn left (Shift+R)" title="Turn left (Shift+R)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path></svg></button>
+        <button class="icon-btn" id="rotR" aria-label="Turn right (R)" title="Turn right (R)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"></path><path d="M21 4v5h-5"></path></svg></button>
+        <div class="sep"></div>
+        <button class="pill" id="cropBtn" title="Crop and straighten (C)">Crop</button>
+        <div class="crop-tools" id="cropTools" hidden>
+          <button class="pill" id="cropAuto">Auto</button>
+          <button class="pill" id="cropFull">Whole bed</button>
+          <label class="straighten">Straighten
+            <input type="range" id="skew" min="-10" max="10" step="0.1">
+            <span class="mono" id="skewVal">0°</span>
+          </label>
+          <button class="pill accent" id="cropDone">Done</button>
+        </div>
+        <div class="spacer"></div>
+        <span class="mono meta" id="pageMeta"></span>
+        <button class="icon-btn" id="rescanBtn" aria-label="Scan this page again (Shift+Space)" title="Scan this page again (Shift+Space)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M20 8V5.5A1.5 1.5 0 0 0 18.5 4H16M4 16v2.5A1.5 1.5 0 0 0 5.5 20H8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"></path><path d="M9 12a3 3 0 1 0 1-2.2"></path><path d="M9 8v2.5h2.5"></path></svg></button>
+        <button class="icon-btn" id="deletePage" aria-label="Remove page (Delete)" title="Remove page (Delete)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"></path></svg></button>
+      </div>
+
+      <div class="viewer" id="viewer">
+        <div class="empty" id="empty">
+          <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#5b5953" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="1.5"></rect><path d="M8 8h5M8 11h8M8 14h8"></path><path d="M2 17h20" stroke="#f2b544"></path></svg>
+          <h2>Place a page on the scanner</h2>
+          <p>Press <kbd>Space</kbd> to scan. Crop, straighten and your adjustments happen on their own.</p>
+          <p class="hint">Or drop pictures here.</p>
+        </div>
+        <div class="canvas-wrap" id="canvasWrap" hidden>
+          <canvas id="view"></canvas>
+          <div class="crop-box" id="cropBox" hidden>
+            <span class="h nw" data-h="nw"></span><span class="h ne" data-h="ne"></span>
+            <span class="h sw" data-h="sw"></span><span class="h se" data-h="se"></span>
+            <span class="h n" data-h="n"></span><span class="h s" data-h="s"></span>
+            <span class="h w" data-h="w"></span><span class="h e" data-h="e"></span>
+            <i class="g g1"></i><i class="g g2"></i><i class="g g3"></i><i class="g g4"></i>
+          </div>
+        </div>
+        <div class="scanning" id="scanning" hidden>
+          <div class="beam"></div>
+          <span id="scanningText">Scanning…</span>
+        </div>
+      </div>
+
+      <div class="scanbar">
+        <button class="scan-btn" id="scanBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M4 7V4h3"></path><path d="M20 7V4h-3"></path><path d="M4 17v3h3"></path><path d="M20 17v3h-3"></path><path d="M4 12h16"></path></svg>
+          <span id="scanLabel">Scan page 1</span>
+          <kbd class="key">Space</kbd>
+        </button>
+        <button class="copy-btn" id="copyBtn" title="Scan the page on the glass and print it straight away">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"></path></svg>
+          Copy
+        </button>
+        <span class="scan-hint" id="scanHint">Place the next page and press Space. Crop, straighten and your adjustments apply automatically.</span>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <div class="panel-scroll">
+        <section class="group">
+          <h3>Colour</h3>
+          <div class="seg" id="modeSeg" role="radiogroup" aria-label="Colour mode">
+            <button data-v="color" role="radio">Colour</button>
+            <button data-v="grey" role="radio">Grey</button>
+            <button data-v="bw" role="radio">B&amp;W</button>
+          </div>
+          <p class="note" id="modeNote" hidden>This page was scanned in grey. Rescan with the Photo preset for colour.</p>
+        </section>
+
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-title">Auto-enhance</div>
+            <div class="toggle-sub">Whitens paper, darkens text</div>
+          </div>
+          <button class="switch" id="autoSwitch" role="switch" aria-checked="true" aria-label="Auto-enhance"><span></span></button>
+        </div>
+
+        <section class="sliders">
+          <label class="slider"><span class="row"><span>Brightness</span><span class="mono" data-out="brightness"></span></span><input type="range" min="-100" max="100" data-adj="brightness"></label>
+          <label class="slider"><span class="row"><span>Contrast</span><span class="mono" data-out="contrast"></span></span><input type="range" min="-100" max="100" data-adj="contrast"></label>
+          <label class="slider"><span class="row"><span>Sharpness</span><span class="mono" data-out="sharpness"></span></span><input type="range" min="0" max="100" data-adj="sharpness"></label>
+          <label class="slider" id="thresholdRow"><span class="row"><span>B&amp;W threshold</span><span class="mono" data-out="threshold"></span></span><input type="range" min="0" max="100" data-adj="threshold"></label>
+        </section>
+
+        <div class="btn-row">
+          <button class="ghost" id="resetBtn">Reset</button>
+          <button class="ghost grow" id="applyAllBtn">Apply to all pages</button>
+        </div>
+
+        <div class="rule"></div>
+
+        <section class="group">
+          <h3>Save</h3>
+          <label class="field">File name
+            <input type="text" id="fileName" spellcheck="false" autocomplete="off">
+          </label>
+          <div class="seg" id="formatSeg" role="radiogroup" aria-label="File type">
+            <button data-v="pdf" role="radio">PDF</button>
+            <button data-v="jpg" role="radio">JPG</button>
+            <button data-v="png" role="radio">PNG</button>
+          </div>
+          <label class="field inline" id="paperRow">Page size
+            <select id="paper">
+              <option value="auto">Snap to A4 / Letter</option>
+              <option value="a4">A4</option>
+              <option value="letter">Letter</option>
+              <option value="actual">As scanned</option>
+            </select>
+          </label>
+          <label class="check" id="searchableRow" title="Uses Windows' own text recognition">
+            <input type="checkbox" id="searchable">
+            <span>Searchable PDF <small>text you can find and copy</small></span>
+          </label>
+          <button class="folder" id="folderBtn" title="Change folder">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z"></path></svg>
+            <span id="folderText" class="mono"></span>
+            <span class="change">Change</span>
+          </button>
+        </section>
+      </div>
+
+      <div class="panel-foot">
+        <button class="save-btn" id="saveBtn"><span id="saveLabel">Save</span><kbd class="key dark">Ctrl S</kbd></button>
+        <div class="btn-row">
+          <button class="ghost grow" id="saveNewBtn">Save and start new batch</button>
+          <button class="ghost" id="printBtn" title="Print the batch (Ctrl+P)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 9V3h12v6"></path><rect x="3" y="9" width="18" height="8" rx="2"></rect><path d="M6 14h12v7H6z"></path></svg>
+            Print
+          </button>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div class="toast" id="toast" hidden role="status" aria-live="polite">
+    <span id="toastText"></span>
+    <button id="toastAction" hidden></button>
+  </div>
+  <div class="print-area" id="printArea"></div>
+  <div class="drop-veil" id="dropVeil" hidden>Drop pictures to add them to the batch</div>
+</div>
+
+<script src="backend.js"></script>
+<script src="imaging.js"></script>
+<script src="pdf.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
