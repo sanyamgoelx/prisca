@@ -19,6 +19,14 @@
       <span class="sr">Resolution</span>
       <select id="dpi"></select>
     </label>
+    <label class="mini-select" title="What's on the glass: one page, several items (receipts, cards, photos) or an open book">
+      <span class="sr">Layout</span>
+      <select id="layout">
+        <option value="page">One page</option>
+        <option value="items">Several items</option>
+        <option value="book">Book: 2 pages</option>
+      </select>
+    </label>
     <label class="mini-select" id="sourceWrap" hidden title="Where the paper is">
       <span class="sr">Source</span>
       <select id="source">
@@ -62,6 +70,7 @@
         </div>
         <div class="spacer"></div>
         <span class="mono meta" id="pageMeta"></span>
+        <button class="icon-btn" id="splitBtn" aria-label="Split this scan into separate items or two book pages" title="Split into separate items, or into two book pages"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="7" height="16" rx="1"></rect><rect x="14" y="4" width="7" height="16" rx="1"></rect></svg></button>
         <button class="icon-btn" id="rescanBtn" aria-label="Scan this page again (Shift+Space)" title="Scan this page again (Shift+Space)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M20 8V5.5A1.5 1.5 0 0 0 18.5 4H16M4 16v2.5A1.5 1.5 0 0 0 5.5 20H8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"></path><path d="M9 12a3 3 0 1 0 1-2.2"></path><path d="M9 8v2.5h2.5"></path></svg></button>
         <button class="icon-btn" id="deletePage" aria-label="Remove page (Delete)" title="Remove page (Delete)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"></path></svg></button>
       </div>
@@ -149,6 +158,10 @@
           <h3>Save</h3>
           <label class="field">File name
             <input type="text" id="fileName" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="check" title="Uses the text Prisca reads on the first page, e.g. Invoice 1043">
+            <input type="checkbox" id="smartName">
+            <span>Name from the page <small>e.g. “Invoice 1043 2026-10-09”</small></span>
           </label>
           <div class="seg" id="formatSeg" role="radiogroup" aria-label="File type">
             <button data-v="pdf" role="radio">PDF</button>

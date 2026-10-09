@@ -32,6 +32,8 @@ function loadSettings() {
     auto: !!s.auto,
     upright: s.upright !== false,
     cast: s.cast && typeof s.cast === 'object' ? s.cast : {},
+    layout: ['page', 'items', 'book'].includes(s.layout) ? s.layout : 'page',
+    smartName: s.smartName !== false,
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     presets,
   };
@@ -79,6 +81,8 @@ $('dpi').onchange = (e) => {
   renderPresets();
 };
 $('source').onchange = (e) => { settings.source = e.target.value; saveSettings(); updateScanBar(); };
+$('layout').value = settings.layout;
+$('layout').onchange = (e) => { settings.layout = e.target.value; saveSettings(); updateScanBar(); };
 
 function currentDevice() {
   return state.devices.find((d) => d.id === settings.deviceId) || state.devices[0] || null;
@@ -152,6 +156,51 @@ async function saveScannerReport() {
   }
 }
 
+// One click: save the scanner report, then open a GitHub issue with the
+// details filled in (the report file is attached by hand: GitHub can't take it from a link).
+async function reportProblem(err) {
+  toast('Collecting details…', { sticky: true });
+  const d = currentDevice();
+  let reportPath = '';
+  if (d) {
+    try {
+      const r = await Backend.probe(d.id, d.name);
+      const report = { prisca: await Backend.version(), when: new Date().toISOString(), device: d, error: err || null, probe: r.probe, log: await Backend.logTail(300) };
+      reportPath = await Backend.saveFile(joinPath(`Prisca scanner report ${today()}.json`), new TextEncoder().encode(JSON.stringify(report, null, 2)));
+    } catch {}
+  }
+  const version = await Backend.version();
+  let log = (await Backend.logTail(40)) || '(empty)';
+  const make = (logText) => [
+    '**What happened?**',
+    '<!-- What did you do, what did you expect, what happened instead? -->',
+    '',
+    '',
+    `**Prisca** ${version} · ${navigator.userAgent.match(/Windows NT [\d.]+/)?.[0] || navigator.platform}`,
+    `**Scanner** ${d ? `${d.name} (${d.manufacturer || 'unknown maker'})${d.feeder ? ', with feeder' : ''}` : 'none found'}`,
+    err ? `**Error** ${err.code || ''} ${err.hresult || ''} ${err.error || ''}`.trim() : '',
+    '',
+    '<details><summary>Scanner log (last lines)</summary>',
+    '',
+    '```',
+    logText,
+    '```',
+    '</details>',
+    '',
+    reportPath ? `A full scanner report was saved to \`${reportPath}\`. Please drag that file into this box.` : '',
+  ].join('\n');
+  let body = make(log);
+  // Links over ~8000 characters don't open reliably.
+  while (encodeURIComponent(body).length > 6500 && log.includes('\n')) {
+    log = log.slice(log.indexOf('\n') + 1);
+    body = make(log);
+  }
+  const title = err && err.error ? `Scanning problem: ${err.error}`.slice(0, 120) : 'Problem: ';
+  const url = `https://github.com/sanyamgoelx/prisca/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  try { await Backend.openUrl(url); } catch {}
+  toast(reportPath ? 'Opened a problem report on GitHub. The scanner report is saved next to your scans: drag it into the report.' : 'Opened a problem report on GitHub.', reportPath ? { action: 'Show report file', onAction: () => Backend.reveal(reportPath), duration: 12000 } : {});
+}
+
 function openDeviceMenu() {
   const m = $('deviceMenu');
   if (!m.hidden) { m.hidden = true; return; }
@@ -174,6 +223,10 @@ function openDeviceMenu() {
     rep.onclick = () => { m.hidden = true; saveScannerReport(); };
     m.appendChild(rep);
   }
+  const bug = document.createElement('button');
+  bug.textContent = 'Report a problem…';
+  bug.onclick = () => { m.hidden = true; reportProblem(lastError); };
+  m.appendChild(bug);
   const note = document.createElement('div');
   note.className = 'menu-note';
   note.textContent = 'Prisca works with any scanner or all-in-one printer that has a Windows driver. Not listed? Install the driver from the maker’s website, check the cable or Wi-Fi, then look again.';
@@ -208,7 +261,7 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
   page.scannedGrey = !!scannedGrey;
   // What this scanner does to white paper (learnt from earlier document scans),
   // so pictures without much white get the same colour correction.
-  page.deviceCast = device && settings.cast[device] ? settings.cast[device] : null;
+  page.deviceCast = device ? settings.cast[device] || KNOWN_CASTS[device] || null : null;
   Imaging.analyse(page);
   if (device && !scannedGrey && page.levels && page.levels.documentLike && page.levels.cast) learnCast(device, page.levels.cast);
   const at = replace ? state.pages.indexOf(replace) : -1;
@@ -229,6 +282,96 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
   if (at < 0) queueUpright(page);
   return page;
 }
+
+// ---------- Several items / book pages ----------
+// One scan becomes several pages: items cut out separately, or the two halves
+// of a book spread. Each piece is straightened, cropped and turned upright on
+// its own.
+async function addPieces(bitmap, dpi, presetKey, scannedGrey, device, layout) {
+  let parts = [bitmap];
+  try {
+    parts = layout === 'items' ? await Imaging.splitItems(bitmap) : layout === 'book' ? await Imaging.splitBook(bitmap) : [bitmap];
+  } catch (e) { console.warn('split failed', e); parts = [bitmap]; }
+  // Halves side by side ('v' gutter) keep the full height; stacked ones the full width.
+  const pair = layout === 'book' && parts.length === 2 ? { id: ++pageSeq, axis: parts[0].width < bitmap.width ? 'v' : 'h' } : null;
+  if (parts.length > 1 && bitmap.close) bitmap.close();
+  const pages = [];
+  for (let i = 0; i < parts.length; i++) {
+    const page = await addBitmap(parts[i], dpi, presetKey, scannedGrey, null, device);
+    if (pair) page.pair = { ...pair, idx: i };
+    pages.push(page);
+  }
+  if (layout === 'items' && parts.length === 1) toast('Only one item found on the glass. Leave a gap between items so Prisca can tell them apart.');
+  return pages;
+}
+
+// After both halves of a spread are turned upright, the left page goes first
+// (a spread laid sideways on the glass can come out bottom page first).
+function orderPair(page) {
+  if (!page.pair) return;
+  const other = state.pages.find((q) => q !== page && q.pair && q.pair.id === page.pair.id);
+  if (!other || !other.uprightDone || !page.uprightDone) return;
+  const first = page.pair.idx === 0 ? page : other, second = first === page ? other : page;
+  const t = (first.autoTurned || second.autoTurned || 0) / 90;
+  const reverse = page.pair.axis === 'v' ? t === 2 : t === 1;
+  const i = state.pages.indexOf(first), j = state.pages.indexOf(second);
+  if (reverse && j === i + 1) {
+    state.pages[i] = second; state.pages[j] = first;
+    const c = cur();
+    renderThumbs();
+    state.current = state.pages.indexOf(c);
+    showPage();
+  }
+}
+
+// Split the page you're looking at: into items if there are several, else into two book pages.
+let lastSplit = null;
+async function splitCurrent() {
+  const p = cur();
+  if (!p || state.scanning) return;
+  if (state.cropping) finishCrop();
+  let parts = await Imaging.splitItems(p.bitmap);
+  let layout = 'items';
+  if (parts.length < 2) { parts = await Imaging.splitBook(p.bitmap); layout = 'book'; }
+  if (parts.length < 2) { toast('Couldn’t find anything to split on this page.'); return; }
+  const index = state.pages.indexOf(p);
+  if (lastSplit) { dropPage(lastSplit.page); lastSplit = null; }
+  state.pages.splice(index, 1);
+  const added = [];
+  const pair = layout === 'book' ? { id: ++pageSeq, axis: parts[0].width < p.bitmap.width ? 'v' : 'h' } : null;
+  for (let i = 0; i < parts.length; i++) {
+    const page = newPage(parts[i], p.dpi, p.preset);
+    page.adj = { ...p.adj };
+    page.deviceCast = p.deviceCast;
+    page.scannedGrey = p.scannedGrey;
+    Imaging.analyse(page);
+    if (pair) page.pair = { ...pair, idx: i };
+    state.pages.splice(index + i, 0, page);
+    added.push(page);
+  }
+  lastSplit = { page: p, index, added };
+  state.current = index;
+  renderThumbs();
+  for (const page of added) { refreshThumb(page); queueUpright(page); }
+  showPage();
+  toast(layout === 'items' ? `Split into ${parts.length} items.` : 'Split into two book pages.', { action: 'Undo', onAction: undoSplit });
+}
+function undoSplit() {
+  if (!lastSplit) return;
+  const { page, index, added } = lastSplit;
+  lastSplit = null;
+  for (const a of added) { const i = state.pages.indexOf(a); if (i >= 0) state.pages.splice(i, 1); dropPage(a); }
+  state.pages.splice(Math.min(index, state.pages.length), 0, page);
+  state.current = state.pages.indexOf(page);
+  renderThumbs();
+  showPage();
+}
+
+// Colour shifts of scanners we have measured, so their very first scan is
+// corrected too (others are learnt from their first document scan).
+const KNOWN_CASTS = {
+  'HP Deskjet 1510 series': [3, -10, 7],
+};
 
 function learnCast(device, cast) {
   const old = settings.cast[device];
@@ -348,6 +491,7 @@ function thumbPointerDown(e, from) {
     }
     renderThumbs();
     showPage();
+    maybeSmartName();
   };
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up);
@@ -369,13 +513,21 @@ async function prepare(page) {
   if (page.prepared && page.prepared.key === key) return;
   await nextFrame();
   const c = Imaging.render(page, Infinity);
-  const jpeg = new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', page.adj.mode === 'bw' ? 0.9 : 0.85)).arrayBuffer());
+  const img = await pageImage(c, page);
   let words = null;
   if (settings.searchable) { try { words = await recognise(c, true); } catch {} }
-  const ready = { key, jpeg, width: c.width, height: c.height, words, ocrTried: settings.searchable };
+  const ready = { key, ...img, width: c.width, height: c.height, words, ocrTried: settings.searchable };
   c.width = c.height = 0;
   // Only keep it if nothing changed meanwhile.
   if (prepKey(page) === key) page.prepared = ready;
+  if (page === state.pages[0]) maybeSmartName();
+}
+
+// The page as it goes into a PDF: true black and white for B&W pages (much
+// smaller), a JPEG otherwise.
+async function pageImage(c, page) {
+  if (page.adj.mode === 'bw') return { bits: await PdfWriter.bitsFrom(c) };
+  return { jpeg: new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', 0.85)).arrayBuffer()) };
 }
 
 const thumbTimers = new Map();
@@ -403,7 +555,7 @@ function showPage() {
   const p = cur();
   $('empty').hidden = !!p;
   $('canvasWrap').hidden = !p;
-  for (const id of ['rotL', 'rotR', 'cropBtn', 'deletePage', 'rescanBtn']) $(id).disabled = !p;
+  for (const id of ['rotL', 'rotR', 'cropBtn', 'deletePage', 'rescanBtn', 'splitBtn']) $(id).disabled = !p;
   document.querySelector('.panel').classList.toggle('disabled', !p);
   syncPanel();
   updateMeta();
@@ -560,10 +712,16 @@ function rotatePage(p, dir) {
 // prepared for saving; never overrides a turn you made yourself.
 let uprightUnavailable = false;
 function queueUpright(page) {
-  if (!settings.upright || uprightUnavailable || !Backend.inApp && !window.PRISCA_MOCK_UPRIGHT) return;
+  if (!settings.upright || uprightUnavailable || !Backend.inApp && !window.PRISCA_MOCK_UPRIGHT) { page.uprightDone = true; return; }
   prepQueue = prepQueue.then(() => uprightPage(page)).catch(() => {});
 }
 async function uprightPage(page) {
+  try { await uprightInner(page); } finally {
+    page.uprightDone = true;
+    if (!page.dropped) { orderPair(page); maybeSmartName(); }
+  }
+}
+async function uprightInner(page) {
   if (page.dropped || page.userRotated || !state.pages.includes(page)) return;
   const base = Imaging.geometry(page.bitmap, { rot: page.rot, skew: page.skew, crop: page.crop, maxDim: 1600 });
   Imaging.tone(base, { mode: 'grey', auto: true, brightness: 0, contrast: 10, sharpness: 0, threshold: 50 }, page.levels);
@@ -607,6 +765,7 @@ function wordScore(r) {
   }
   return n;
 }
+$('splitBtn').onclick = () => splitCurrent();
 $('rotL').onclick = () => rotate(-1);
 $('rotR').onclick = () => rotate(1);
 $('deletePage').onclick = () => removePage(state.current);
@@ -677,7 +836,7 @@ function updateScanBar() {
     : 'Place the next page and press Space. Crop, straighten and your adjustments apply automatically.';
 }
 
-let scanClock = null;
+let scanClock = null, lastError = null;
 async function scan({ replace = null, copy = false } = {}) {
   if (state.scanning || state.saving) return;
   stopAuto();
@@ -723,7 +882,11 @@ async function scan({ replace = null, copy = false } = {}) {
     done();
     if (e && e.code === 'cancelled') toast('Scan cancelled.');
     else {
-      toast((e && e.error) || 'Scanning failed.', { bad: true, action: 'Try again', onAction: scan });
+      lastError = e || null;
+      const odd = !e || ['unknown', 'driver', 'crashed', 'timeout', 'helper', 'unsupported', 'setting', 'general'].includes(e.code);
+      toast((e && e.error) || 'Scanning failed.', odd
+        ? { bad: true, action: 'Report a problem', onAction: () => reportProblem(e) }
+        : { bad: true, action: 'Try again', onAction: scan });
       if (e && (e.code === 'notfound' || e.code === 'offline')) loadDevices();
     }
     return;
@@ -737,17 +900,22 @@ async function scan({ replace = null, copy = false } = {}) {
   for (const f of files) {
     const bitmap = await createImageBitmap(new Blob([f.bytes]));
     const target = replace && state.pages.includes(replace) && files.length === 1 ? replace : null;
-    const page = await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target, d.name);
-    page.scanMs = scanMs;
-    // Feeder batches: drop blank sheets (backs of one-sided pages).
-    if (source === 'feeder' && Imaging.isBlank(page)) { removePage(state.pages.indexOf(page), { undoable: false }); blank++; continue; }
-    added.push(page);
+    const layout = target || copy || source === 'feeder' ? 'page' : settings.layout;
+    const pieces = layout === 'page'
+      ? [await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target, d.name)]
+      : await addPieces(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, d.name, layout);
+    for (const page of pieces) {
+      page.scanMs = scanMs;
+      // Feeder batches: drop blank sheets (backs of one-sided pages).
+      if (source === 'feeder' && Imaging.isBlank(page)) { removePage(state.pages.indexOf(page), { undoable: false }); blank++; continue; }
+      added.push(page);
+    }
   }
   updateMeta();
   console.info(`[Prisca] scan ${scanMs} ms (scanner helper ${r.totalMs} ms, of which setup ${r.setupMs} ms, warm ${r.warm}); processing ${Math.round(performance.now() - t1)} ms`);
   if (blank) toast(`Skipped ${blank} blank page${blank === 1 ? '' : 's'}.`);
   if (copy && added.length) { await printPages(added); return; }
-  if (!replace && source === 'flatbed' && autoRunning) afterAutoScan(added[0]);
+  if (!replace && source === 'flatbed' && autoRunning) afterAutoScan(added[0], added.length);
 }
 
 // ---------- Hands-free: scan again after a countdown ----------
@@ -755,8 +923,9 @@ async function scan({ replace = null, copy = false } = {}) {
 // page and keep going. Stops on Esc, on an empty glass, or when the same page
 // comes back (not swapped in time).
 let autoTimer = null, autoLeft = 0, autoRunning = false, releaseTimer = null;
-function afterAutoScan(page) {
+function afterAutoScan(page, count = 1) {
   if (!page) return;
+  if (count > 1) { startCountdown(); return; }
   const i = state.pages.indexOf(page);
   if (Imaging.isBlank(page)) {
     removePage(i, { undoable: false });
@@ -819,7 +988,8 @@ async function importBytes(list) {
   for (const { bytes, name } of list) {
     try {
       const bitmap = await createImageBitmap(new Blob([bytes]));
-      await addBitmap(bitmap, 200, settings.preset, false);
+      if (settings.layout === 'page') await addBitmap(bitmap, 200, settings.preset, false);
+      else await addPieces(bitmap, 200, settings.preset, false, null, settings.layout);
       added++;
     } catch {
       toast(`Couldn’t open ${name}. Use PNG, JPG, BMP, WebP or GIF.`, { bad: true });
@@ -859,6 +1029,8 @@ function today() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 async function suggestName() {
+  state.smartFor = null;
+  state.smartNamed = false;
   const prefix = `Scan ${today()}`;
   let n = 1;
   try { n = await Backend.nextNumber(settings.folder, prefix); } catch {}
@@ -866,6 +1038,99 @@ async function suggestName() {
   state.nameEdited = false;
 }
 $('fileName').addEventListener('input', () => { state.nameEdited = true; });
+$('smartName').checked = settings.smartName;
+$('smartName').onchange = (e) => { settings.smartName = e.target.checked; saveSettings(); if (settings.smartName) maybeSmartName(); else if (!state.nameEdited) suggestName(); };
+
+// ---------- Names from the page's text ----------
+// Reads the first page (the same text recognition as searchable PDFs) and
+// suggests e.g. "Invoice 1043 2026-10-09". Never replaces a name you typed.
+let smartBusy = false;
+async function maybeSmartName() {
+  const page = state.pages[0];
+  if (!settings.smartName || state.nameEdited || !page || smartBusy) return;
+  if (state.smartFor === page.id) return;
+  if (!page.uprightDone) return; // wait until it's the right way up
+  smartBusy = true;
+  try {
+    const ready = page.prepared && page.prepared.key === prepKey(page) ? page.prepared : null;
+    let words = ready ? ready.words : null, height = ready ? ready.height : 0;
+    if (!words) {
+      const c = Imaging.render(page, 2200);
+      try { words = await recognise(c, true); } catch { words = null; }
+      height = c.height;
+      c.width = c.height = 0;
+    }
+    if (state.nameEdited || state.pages[0] !== page) return;
+    const name = nameFromWords(words || [], height);
+    state.smartFor = page.id;
+    if (name) { $('fileName').value = `${name} ${today()}`; state.smartNamed = true; }
+    else if (state.smartNamed) { state.smartNamed = false; await suggestName(); }
+  } finally {
+    smartBusy = false;
+    // The first page may have changed meanwhile.
+    if (state.pages[0] && state.smartFor !== state.pages[0].id) setTimeout(maybeSmartName, 0);
+  }
+}
+
+const DOC_TYPES = [
+  [/\btax\s+invoice\b|\binvoice\b/i, 'Invoice'],
+  [/\bcredit\s+note\b/i, 'Credit Note'],
+  [/\bpurchase\s+order\b/i, 'Purchase Order'],
+  [/\bdelivery\s+(?:note|challan)\b|\bchallan\b/i, 'Challan'],
+  [/\b(?:pay|salary)\s*slip\b/i, 'Payslip'],
+  [/\bquotation\b|\bquote\b/i, 'Quotation'],
+  [/\bestimate\b/i, 'Estimate'],
+  [/\bstatement\b/i, 'Statement'],
+  [/\breceipt\b/i, 'Receipt'],
+  [/\bcash\s+memo\b|\bbill\b/i, 'Bill'],
+  [/\border\b/i, 'Order'],
+];
+// words: [{ t, l (line), x, y, w, h }] from recognise().
+function nameFromWords(words, imageHeight = 0) {
+  if (!words.length) return null;
+  const lines = [];
+  for (const w of words) {
+    let L = lines[w.l];
+    if (!L) L = lines[w.l] = { words: [], y: Infinity, hs: [] };
+    L.words.push(w); L.y = Math.min(L.y, w.y); L.hs.push(w.h);
+  }
+  const list = lines.filter(Boolean).map((L) => {
+    L.hs.sort((a, b) => a - b);
+    return { text: L.words.map((w) => w.t).join(' '), y: L.y, h: L.hs[L.hs.length >> 1], words: L.words.map((w) => w.t) };
+  }).sort((a, b) => a.y - b.y);
+  const pageH = imageHeight || Math.max(...words.map((w) => w.y + w.h));
+  const isDate = (s) => /^\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}$/.test(s);
+  const isNumber = (s) => /\d.*\d/.test(s) && /^[A-Za-z]{0,5}[\-\/#]?[A-Za-z0-9][A-Za-z0-9\-\/]{1,18}$/.test(s) && !isDate(s) && !/^\d+[.,]\d{2}$/.test(s);
+  // A document type near the top, with its number.
+  for (let i = 0; i < Math.min(list.length, 30); i++) {
+    const L = list[i];
+    if (L.y > pageH * 0.6) break;
+    const hit = DOC_TYPES.find(([re]) => re.test(L.text));
+    if (!hit) continue;
+    let number = null;
+    for (const cand of [L, list[i + 1], list[i + 2]].filter(Boolean)) {
+      const toks = cand.words.map((s) => s.replace(/[:,;]+$/, '').replace(/^[#:]+/, ''));
+      const k = toks.findIndex((s, j) => j > 0 && /^(no\.?|number|num|#)$/i.test(toks[j - 1]) && isNumber(s));
+      number = k >= 0 ? toks[k] : toks.find(isNumber) || null;
+      if (number) break;
+    }
+    return clean(number ? `${hit[1]} ${number}` : hit[1]);
+  }
+  // Otherwise the biggest heading in the top part of the page.
+  const heads = list.filter((L) => L.y < pageH * 0.45 && (L.text.match(/[A-Za-z]{2,}/g) || []).length >= 1);
+  if (!heads.length) return null;
+  const big = heads.reduce((a, b) => (b.h > a.h * 1.05 ? b : a));
+  const median = list.map((L) => L.h).sort((a, b) => a - b)[list.length >> 1];
+  if (big.h < median * 1.25 && list.length > 3) return null; // no real heading
+  let words2 = big.words.filter((s) => /[A-Za-z]/.test(s)).slice(0, 6);
+  if (!words2.length) return null;
+  if (words2.every((s) => s === s.toUpperCase())) words2 = words2.map((s) => s.charAt(0) + s.slice(1).toLowerCase());
+  return clean(words2.join(' '));
+
+  function clean(s) {
+    return s.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 50) || null;
+  }
+}
 
 function renderFormat() {
   for (const b of $('formatSeg').children) b.setAttribute('aria-checked', String(b.dataset.v === settings.format));
@@ -963,20 +1228,20 @@ async function save(startNew) {
         const ready = pages[i].prepared;
         if (ready && ready.key === prepKey(pages[i]) && (ready.words || ready.ocrTried || !settings.searchable)) {
           const [pageW, pageH] = PdfWriter.pageSize(ready.width, ready.height, pages[i].dpi, settings.paper);
-          parts.push({ jpeg: ready.jpeg, width: ready.width, height: ready.height, dpi: pages[i].dpi, words: ready.words, pageW, pageH });
+          parts.push({ jpeg: ready.jpeg, bits: ready.bits, width: ready.width, height: ready.height, dpi: pages[i].dpi, words: ready.words, pageW, pageH });
           continue;
         }
         toast(`Preparing page ${i + 1} of ${n}…`, { sticky: true });
         await nextFrame();
         const c = Imaging.render(pages[i], Infinity);
-        const jpeg = new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', pages[i].adj.mode === 'bw' ? 0.9 : 0.85)).arrayBuffer());
+        const img = await pageImage(c, pages[i]);
         let words = null;
         if (settings.searchable) {
           toast(`Reading the text on page ${i + 1} of ${n}…`, { sticky: true });
           try { words = await recognise(c); } catch (e) { console.warn('OCR failed', e); }
         }
         const [pageW, pageH] = PdfWriter.pageSize(c.width, c.height, pages[i].dpi, settings.paper);
-        parts.push({ jpeg, width: c.width, height: c.height, dpi: pages[i].dpi, words, pageW, pageH });
+        parts.push({ ...img, width: c.width, height: c.height, dpi: pages[i].dpi, words, pageW, pageH });
         c.width = c.height = 0;
       }
       toast('Writing PDF…', { sticky: true });
@@ -1001,6 +1266,7 @@ async function save(startNew) {
     if (startNew) {
       while (state.pages.length) removePage(0, { undoable: false });
       if (lastRemoved) { dropPage(lastRemoved.page); lastRemoved = null; }
+      if (lastSplit) { dropPage(lastSplit.page); lastSplit = null; }
       await suggestName();
     }
   } catch (e) {

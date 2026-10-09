@@ -100,6 +100,15 @@ fn scanner_log_path(app: tauri::AppHandle) -> String {
     cache_dir(&app).join("scanner.log").to_string_lossy().to_string()
 }
 
+/// The last lines of the scanner diagnostics log (for problem reports).
+#[tauri::command]
+fn scanner_log_tail(app: tauri::AppHandle, lines: usize) -> String {
+    let text = std::fs::read_to_string(cache_dir(&app).join("scanner.log")).unwrap_or_default();
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines.min(500));
+    all[start..].join("\n")
+}
+
 fn secs(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n)
 }
@@ -265,6 +274,7 @@ pub fn run() {
             probe_scanner,
             release_scanner,
             scanner_log_path,
+            scanner_log_tail,
             read_file,
             discard_scan,
             save_file,

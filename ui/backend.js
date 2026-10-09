@@ -37,6 +37,9 @@ const Backend = (() => {
     probe: (device, deviceName) => call('probe_scanner', { device, deviceName }),
     releaseScanner: () => call('release_scanner').catch(() => {}),
     logPath: () => call('scanner_log_path'),
+    logTail: (lines) => call('scanner_log_tail', { lines }).catch(() => ''),
+    version: async () => { try { return await T.app.getVersion(); } catch { return '?'; } },
+    openUrl: (url) => T.opener.openUrl(url),
     ocr: (jpeg) => call('ocr_page', jpeg),
     readFile: async (path) => new Uint8Array(await call('read_file', { path })),
     discard: (path) => call('discard_scan', { path }).catch(() => {}),
@@ -83,6 +86,7 @@ const Backend = (() => {
       await new Promise((r) => setTimeout(r, window.PRISCA_MOCK_DELAY ?? 1200));
       if (cancelled) throw { code: 'cancelled', error: 'Scanning was cancelled.' };
       const path = `mock://scan-${Date.now()}.png`;
+      if (window.PRISCA_MOCK_IMAGE) { files.set(path, new Uint8Array(await (await fetch(window.PRISCA_MOCK_IMAGE)).arrayBuffer())); return { pages: [{ path }], dpi: o.dpi }; }
       files.set(path, window.PRISCA_MOCK_BLANK ? await blankScan(o.dpi) : window.PRISCA_MOCK_SAME && lastFake ? lastFake : (lastFake = await fakeScan(o.dpi, o.intent)));
       return { pages: [{ path }], dpi: o.dpi };
     },
@@ -90,6 +94,9 @@ const Backend = (() => {
     probe: async () => ({ probe: { mock: true } }),
     releaseScanner: async () => {},
     logPath: async () => '',
+    logTail: async () => '12:00:00.000 scan: device=Mock dpi=200 intent=grey\n12:00:19.000 scan done',
+    version: async () => 'preview',
+    openUrl: async (url) => { window.PRISCA_OPENED = url; },
     ocr: async () => window.PRISCA_MOCK_OCR || { available: false, lines: [] },
     readFile: async (path) => files.get(path),
     discard: async (path) => files.delete(path),

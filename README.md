@@ -8,6 +8,12 @@ Fast scanning for any scanner or all-in-one printer on Windows (Pri + Sca: Print
 - Save as one PDF (searchable: Windows' own text recognition adds a hidden text layer; page size snaps to A4/Letter), or a JPG/PNG per page. Names like `Scan 2026-10-09 001`, saved in `Documents\Prisca` (changeable).
 - **Print** the batch, or **Copy**: scan and print in one press.
 - Scanners with a document feeder get a Glass/Feeder choice; the feeder scans every page in one go and skips blank sheets.
+- **Several items at once**: lay receipts, cards or photos on the glass with a gap between them, pick *Several items*, and each becomes its own straightened page (one scan instead of four).
+- **Book mode**: *Book: 2 pages* splits an open book or notebook at the gutter into two pages, in reading order. The split button (toolbar) does the same for a page already scanned.
+- Pages are turned upright automatically (reads the text), and the scanner's colour tint is removed.
+- File names come from the first page when it has a clear title, e.g. `Invoice 1043 2026-10-09`.
+- Black-and-white pages are saved as true black and white: PDFs about a tenth of the size.
+- **Report a problem** (scanner menu, or on a scan error) opens a pre-filled GitHub issue and saves a scanner report to attach.
 - Drop pictures (or **Add pictures**) to clean up photos of documents the same way.
 - Updates install themselves.
 

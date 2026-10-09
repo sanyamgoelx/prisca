@@ -4,7 +4,7 @@
 const PdfWriter = (() => {
   const enc = new TextEncoder();
 
-  // pages: [{ jpeg: Uint8Array, width, height (pixels), dpi }]
+  // pages: [{ jpeg | bits: Uint8Array, width, height (pixels), dpi, words?, pageW?, pageH? }]
   function build(pages, title) {
     const chunks = [];
     let length = 0;
@@ -50,7 +50,12 @@ const PdfWriter = (() => {
       const dw = iw * fit, dh = ih * fit, ox = (W - dw) / 2, oy = (H - dh) / 2;
       const font = hasText ? ` /Font << /F1 ${fontN} 0 R >>` : '';
       obj(pageN, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] /Resources << /XObject << /Im0 ${imgN} 0 R >>${font} /ProcSet [/PDF /Text /ImageC /ImageB] >> /Contents ${contentN} 0 R >>`);
-      obj(imgN, `<< /Type /XObject /Subtype /Image /Width ${p.width} /Height ${p.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${p.jpeg.length} >>`, p.jpeg);
+      if (p.bits) {
+        // Black and white: one bit per pixel, deflated (about a tenth of a JPEG).
+        obj(imgN, `<< /Type /XObject /Subtype /Image /Width ${p.width} /Height ${p.height} /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode /Length ${p.bits.length} >>`, p.bits);
+      } else {
+        obj(imgN, `<< /Type /XObject /Subtype /Image /Width ${p.width} /Height ${p.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${p.jpeg.length} >>`, p.jpeg);
+      }
       const content = latin1(`q ${round2(dw)} 0 0 ${round2(dh)} ${round2(ox)} ${round2(oy)} cm /Im0 Do Q` + textLayer(p.words, (72 / dpi) * fit, ox, oy, p.height));
       obj(contentN, `<< /Length ${content.length} >>`, content);
     });
@@ -157,5 +162,21 @@ const PdfWriter = (() => {
     return [iw, ih];
   }
 
-  return { build, pageSize };
+  // A black-and-white page as packed bits (1 = white), zlib-deflated for /FlateDecode.
+  async function bitsFrom(canvas) {
+    const w = canvas.width, h = canvas.height;
+    const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    const rowBytes = (w + 7) >> 3;
+    const raw = new Uint8Array(rowBytes * h);
+    for (let y = 0; y < h; y++) {
+      const row = y * rowBytes;
+      for (let x = 0; x < w; x++) {
+        if (d[(y * w + x) * 4] >= 128) raw[row + (x >> 3)] |= 0x80 >> (x & 7);
+      }
+    }
+    const stream = new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  return { build, pageSize, bitsFrom };
 })();

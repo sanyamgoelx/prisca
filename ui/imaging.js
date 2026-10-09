@@ -483,18 +483,29 @@ const Imaging = (() => {
     const grown = dilate(mask, w, h, r);
     const comps = components(grown, w, h);
     const minArea = w * h * 0.012;
-    let boxes = comps.filter((c) => c.area >= minArea).map((c) => ({
-      x0: Math.max(0, c.x0 + r), y0: Math.max(0, c.y0 + r), x1: Math.min(w - 1, c.x1 - r), y1: Math.min(h - 1, c.y1 - r),
-    })).filter((b) => b.x1 > b.x0 && b.y1 > b.y0);
+    let boxes = comps.filter((c) => c.area >= minArea).map((c) => ({ x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 }));
     if (boxes.length < 2) return [src];
     // Reading order: rows top to bottom, then left to right.
     boxes.sort((a, b) => (Math.abs(a.y0 - b.y0) < h * 0.08 ? a.x0 - b.x0 : a.y0 - b.y0));
+    // Room around each item for its paper edges (a receipt's margins hold no
+    // ink), but never past halfway to the next item.
+    const pad = Math.round(Math.max(w, h) * 0.04);
+    const grownBoxes = boxes.map((b, i) => {
+      let x0 = Math.max(0, b.x0 - pad), y0 = Math.max(0, b.y0 - pad), x1 = Math.min(w - 1, b.x1 + pad), y1 = Math.min(h - 1, b.y1 + pad);
+      boxes.forEach((o, j) => {
+        if (i === j) return;
+        const overlapY = o.y0 < b.y1 && o.y1 > b.y0, overlapX = o.x0 < b.x1 && o.x1 > b.x0;
+        if (overlapY && o.x0 >= b.x1) x1 = Math.min(x1, (b.x1 + o.x0) >> 1);
+        if (overlapY && o.x1 <= b.x0) x0 = Math.max(x0, (b.x0 + o.x1) >> 1);
+        if (overlapX && o.y0 >= b.y1) y1 = Math.min(y1, (b.y1 + o.y0) >> 1);
+        if (overlapX && o.y1 <= b.y0) y0 = Math.max(y0, (b.y0 + o.y1) >> 1);
+      });
+      return { x0, y0, x1, y1 };
+    });
     const sx = src.width / w, sy = src.height / h;
-    const pad = Math.round(Math.max(w, h) * 0.015);
     const out = [];
-    for (const b of boxes) {
-      const x = Math.max(0, (b.x0 - pad) * sx), y = Math.max(0, (b.y0 - pad) * sy);
-      const x2 = Math.min(src.width, (b.x1 + pad + 1) * sx), y2 = Math.min(src.height, (b.y1 + pad + 1) * sy);
+    for (const b of grownBoxes) {
+      const x = b.x0 * sx, y = b.y0 * sy, x2 = Math.min(src.width, (b.x1 + 1) * sx), y2 = Math.min(src.height, (b.y1 + 1) * sy);
       out.push(await createImageBitmap(src, Math.round(x), Math.round(y), Math.round(x2 - x), Math.round(y2 - y)));
     }
     return out;
@@ -504,43 +515,76 @@ const Imaging = (() => {
   // Two facing pages: splits at the gutter (the shadow or empty band between
   // the pages), across whichever way the spread lies on the glass.
   async function splitBook(src) {
-    const g = greyOf(geometry(src, { maxDim: 600 }));
+    const g = greyOf(geometry(src, { maxDim: 700 }));
     const { L, w, h } = g;
-    // Where the book is: the box of everything that isn't plain lid.
-    const crop = detectCrop(src, 0, 0);
-    const x0 = Math.round(crop.x * w), y0 = Math.round(crop.y * h);
-    const x1 = Math.round((crop.x + crop.w) * w), y1 = Math.round((crop.y + crop.h) * h);
-    const vertical = (x1 - x0) >= (y1 - y0); // pages side by side
-    const len = vertical ? x1 - x0 : y1 - y0;
-    if (len < 40) return [src];
-    // Darkness profile across the book; the gutter is the darkest (shadow) or
-    // emptiest band in the middle third.
-    const prof = new Float64Array(len);
-    for (let k = 0; k < len; k++) {
-      let s = 0, n = 0;
-      if (vertical) { for (let y = y0; y < y1; y += 2) { s += L[y * w + x0 + k]; n++; } }
-      else { for (let x = x0; x < x1; x += 2) { s += L[(y0 + k) * w + x]; n++; } }
-      prof[k] = s / Math.max(1, n);
-    }
-    const from = Math.round(len / 3), to = Math.round((len * 2) / 3);
-    let mean = 0;
-    for (let k = from; k < to; k++) mean += prof[k];
-    mean /= Math.max(1, to - from);
-    // A shadow line (clearly darker than its surroundings) wins; else the middle.
-    let best = Math.round(len / 2), bestV = Infinity;
-    for (let k = from + 2; k < to - 2; k++) {
-      const v = (prof[k - 2] + prof[k - 1] + prof[k] + prof[k + 1] + prof[k + 2]) / 5;
-      if (v < bestV) { bestV = v; best = k; }
-    }
-    if (bestV > mean - 6) best = Math.round(len / 2);
-    const cut = (vertical ? x0 : y0) + best;
+    const box = contentBox(L, w, h);
+    if (!box) return [src];
+    const paper = (() => { const hs = new Uint32Array(256); for (let y = box.y0; y < box.y1; y += 2) for (let x = box.x0; x < box.x1; x += 2) hs[L[y * w + x]]++; return peakOf(hs); })();
+    // For each way the spread could lie, look for the gutter in the middle third:
+    // a shadow (a band clearly darker than the paper around it) or else the
+    // widest band with no ink running all the way across.
+    const look = (vertical) => {
+      const a0 = vertical ? box.x0 : box.y0, a1 = vertical ? box.x1 : box.y1;
+      const b0 = vertical ? box.y0 : box.x0, b1 = vertical ? box.y1 : box.x1;
+      const len = a1 - a0;
+      const mean = new Float64Array(len), ink = new Float64Array(len);
+      for (let k = 0; k < len; k++) {
+        let s = 0, n = 0, dark = 0;
+        for (let u = b0; u < b1; u += 2) {
+          const v = vertical ? L[u * w + a0 + k] : L[(a0 + k) * w + u];
+          s += v; n++; if (v < paper - 60) dark++;
+        }
+        mean[k] = s / Math.max(1, n); ink[k] = dark / Math.max(1, n);
+      }
+      const from = Math.round(len / 3), to = Math.round((len * 2) / 3);
+      let around = 0;
+      for (let k = from; k < to; k++) around += mean[k];
+      around /= Math.max(1, to - from);
+      let shadowAt = -1, depth = 0;
+      for (let k = from + 3; k < to - 3; k++) {
+        let v = 0; for (let j = -3; j <= 3; j++) v += mean[k + j]; v /= 7;
+        if (around - v > depth) { depth = around - v; shadowAt = k; }
+      }
+      let runAt = -1, run = 0, cur0 = -1;
+      for (let k = from; k <= to; k++) {
+        const clear = k < to && ink[k] < 0.004;
+        if (clear && cur0 < 0) cur0 = k;
+        if (!clear && cur0 >= 0) { if (k - cur0 > run) { run = k - cur0; runAt = (cur0 + k) >> 1; } cur0 = -1; }
+      }
+      return { vertical, a0, len, depth, shadowAt, run: run / Math.max(1, len), runAt };
+    };
+    const V = look(true), H = look(false);
+    let pick;
+    if (Math.max(V.depth, H.depth) > 8) pick = V.depth >= H.depth ? V : H;
+    else if (Math.max(V.run, H.run) > 0.01) pick = V.run >= H.run ? V : H;
+    else pick = (box.x1 - box.x0) >= (box.y1 - box.y0) ? V : H;
+    const at = pick.depth > 8 ? pick.shadowAt : pick.runAt >= 0 ? pick.runAt : pick.len >> 1;
+    const cut = pick.a0 + at;
     const sx = src.width / w, sy = src.height / h;
-    if (vertical) {
+    if (pick.vertical) {
       const c = Math.round(cut * sx);
       return [await createImageBitmap(src, 0, 0, c, src.height), await createImageBitmap(src, c, 0, src.width - c, src.height)];
     }
     const c = Math.round(cut * sy);
     return [await createImageBitmap(src, 0, 0, src.width, c), await createImageBitmap(src, 0, c, src.width, src.height - c)];
+  }
+
+  // The box around everything with clear edges (text, pictures, paper edges
+  // with a shadow), inside the bed's border.
+  function contentBox(L, w, h) {
+    const bx = Math.max(2, Math.round(w * 0.015)), by = Math.max(2, Math.round(h * 0.015));
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    const rowHits = new Uint32Array(h), colHits = new Uint32Array(w);
+    for (let y = by; y < h - by; y++) {
+      for (let x = bx; x < w - bx; x++) {
+        const i = y * w + x;
+        if (Math.abs(L[i + 1] - L[i - 1]) + Math.abs(L[i + w] - L[i - w]) > 36) { rowHits[y]++; colHits[x]++; }
+      }
+    }
+    for (let y = 0; y < h; y++) if (rowHits[y] >= 2) { y0 = Math.min(y0, y); y1 = y; }
+    for (let x = 0; x < w; x++) if (colHits[x] >= 2) { x0 = Math.min(x0, x); x1 = x; }
+    if (x1 - x0 < 20 || y1 - y0 < 20) return null;
+    return { x0, y0, x1: x1 + 1, y1: y1 + 1 };
   }
 
   function dilate(m, w, h, r) {
