@@ -31,10 +31,11 @@ const Backend = (() => {
     },
     scan: async (o) => {
       const r = await call('scan', { device: o.device || '', deviceName: o.deviceName || '', dpi: o.dpi, intent: o.intent, source: o.source });
-      return { pages: toArray(r.pages), dpi: r.dpi, simple: !!r.simple };
+      return { pages: toArray(r.pages), dpi: r.dpi, simple: !!r.simple, setupMs: r.setupMs, totalMs: r.totalMs, warm: !!r.warm };
     },
     cancel: () => call('cancel_scan').catch(() => {}),
     probe: (device, deviceName) => call('probe_scanner', { device, deviceName }),
+    releaseScanner: () => call('release_scanner').catch(() => {}),
     logPath: () => call('scanner_log_path'),
     ocr: (jpeg) => call('ocr_page', jpeg),
     readFile: async (path) => new Uint8Array(await call('read_file', { path })),
@@ -82,11 +83,12 @@ const Backend = (() => {
       await new Promise((r) => setTimeout(r, window.PRISCA_MOCK_DELAY ?? 1200));
       if (cancelled) throw { code: 'cancelled', error: 'Scanning was cancelled.' };
       const path = `mock://scan-${Date.now()}.png`;
-      files.set(path, await fakeScan(o.dpi, o.intent));
+      files.set(path, window.PRISCA_MOCK_BLANK ? await blankScan(o.dpi) : window.PRISCA_MOCK_SAME && lastFake ? lastFake : (lastFake = await fakeScan(o.dpi, o.intent)));
       return { pages: [{ path }], dpi: o.dpi };
     },
     cancel: async () => { cancelled = true; },
     probe: async () => ({ probe: { mock: true } }),
+    releaseScanner: async () => {},
     logPath: async () => '',
     ocr: async () => window.PRISCA_MOCK_OCR || { available: false, lines: [] },
     readFile: async (path) => files.get(path),
@@ -107,7 +109,13 @@ const Backend = (() => {
     onFileDrop: () => {},
   };
 
-  let fakeCount = 0;
+  let fakeCount = 0, lastFake = null;
+  async function blankScan(dpi) {
+    const s = dpi / 100, c = document.createElement('canvas');
+    c.width = Math.round(850 * s); c.height = Math.round(1169 * s);
+    const g = c.getContext('2d'); g.fillStyle = '#e9e8e4'; g.fillRect(0, 0, c.width, c.height);
+    return new Uint8Array(await (await new Promise((r) => c.toBlob(r, 'image/png'))).arrayBuffer());
+  }
   async function fakeScan(dpi, intent) {
     const s = dpi / 100;
     const W = Math.round(850 * s), H = Math.round(1169 * s); // A4-ish flatbed
@@ -138,11 +146,13 @@ const Backend = (() => {
     g.fillStyle = '#444';
     g.font = `${11 * s}px sans-serif`;
     const words = 'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor'.split(' ');
+    const seed = fakeCount * 7;
     let y = 120 * s;
     for (let l = 0; l < 34; l++) {
       if (l % 9 === 8) { y += 14 * s; continue; }
       let line = '';
-      for (let k = 0; k < 9; k++) line += words[(l * 7 + k * 3) % words.length] + ' ';
+      const len = 3 + ((l * 5 + seed) % 7);
+      for (let k = 0; k < len; k++) line += words[(l * 7 + k * 3 + seed) % words.length] + ' ';
       g.fillText(line, 40 * s, y);
       y += 18 * s;
     }

@@ -258,7 +258,8 @@ const Imaging = (() => {
       for (let v = 128; v < 256; v++) if (hist[v] > peakCount) { peakCount = hist[v]; peak = v; }
       hi = Math.max(pct(0.6), peak - 6);
     }
-    if (hi - lo < 60) { hi = Math.min(255, lo + 60); }
+    // A nearly flat picture (blank sheet, empty glass): keep it light, not stretched to black.
+    if (hi - lo < 60) { lo = Math.max(0, hi - 120); }
     const out = { lo, hi };
     if (kind !== 'photo') {
       // Paper colour per channel, so cream or grey paper turns white in colour scans.
@@ -390,5 +391,31 @@ const Imaging = (() => {
     return n > 0 && dark / n < 0.002;
   }
 
-  return { isBlank, geometry, turnedSize, detectSkew, detectCrop, detectLevels, refreshLevels, analyse, render, tone, toBlob, makeCanvas };
+  // Where the ink is on the finished page, blurred to a coarse grid: two scans
+  // of the same sheet (not swapped in time) correlate almost perfectly; two
+  // different pages of the same layout differ in where their words fall.
+  function inkMap(page) {
+    const c = geometry(page.bitmap, { rot: page.rot, skew: page.skew, crop: page.crop, maxDim: 240 });
+    tone(c, { mode: 'grey', auto: true, brightness: 0, contrast: 0, sharpness: 0, threshold: 50 }, page.levels);
+    const s = makeCanvas(48, 64);
+    const g = s.getContext('2d', { willReadFrequently: true });
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(c, 0, 0, 48, 64);
+    const L = luminance(g.getImageData(0, 0, 48, 64).data);
+    return Float64Array.from(L, (v) => 255 - v);
+  }
+  function samePage(a, b) {
+    const x = inkMap(a), y = inkMap(b);
+    const n = x.length;
+    let mx = 0, my = 0;
+    for (let i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
+    mx /= n; my /= n;
+    let sxy = 0, sxx = 0, syy = 0;
+    for (let i = 0; i < n; i++) { const dx = x[i] - mx, dy = y[i] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+    if (sxx < 1e-6 && syy < 1e-6) return true; // both empty
+    const r = sxy / Math.sqrt(sxx * syy + 1e-9);
+    return r > 0.975;
+  }
+
+  return { isBlank, samePage, geometry, turnedSize, detectSkew, detectCrop, detectLevels, refreshLevels, analyse, render, tone, toBlob, makeCanvas };
 })();

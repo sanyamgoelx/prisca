@@ -195,3 +195,12 @@ input[type=range] { accent-color: var(--accent); width: 100%; margin: 0; }
 .copy-btn { height: 56px; padding: 0 20px; background: transparent; color: var(--text); border: 1px solid var(--line-2); border-radius: 10px; font-size: 15px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 10px; }
 .copy-btn:hover { background: var(--raised); }
 .copy-btn:disabled { opacity: .45; cursor: default; }
+
+.auto-btn { height: 56px; padding: 0 14px; background: transparent; color: var(--text-2); border: 1px solid var(--line-2); border-radius: 10px; font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+.auto-btn:hover { background: var(--raised); }
+.auto-btn .dot-sw { width: 10px; height: 10px; border-radius: 50%; background: #34363c; }
+.auto-btn[aria-checked="true"] { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+.auto-btn[aria-checked="true"] .dot-sw { background: var(--accent); }
+.auto-btn .delay { font-size: 12px; padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,.06); }
+.auto-btn .delay:hover { background: rgba(255,255,255,.14); }
+.scanbar { gap: 12px; }

@@ -29,6 +29,8 @@ function loadSettings() {
     source: s.source === 'feeder' ? 'feeder' : 'flatbed',
     searchable: s.searchable !== false,
     paper: ['auto', 'a4', 'letter', 'actual'].includes(s.paper) ? s.paper : 'auto',
+    auto: !!s.auto,
+    autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     presets,
   };
 }
@@ -249,6 +251,9 @@ function removePage(i, { undoable = true } = {}) {
 }
 
 function dropPage(p) {
+  p.dropped = true;
+  clearTimeout(thumbTimers.get(p.id));
+  clearTimeout(prepTimers.get(p.id));
   if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
   if (p.bitmap.close) p.bitmap.close();
 }
@@ -335,10 +340,37 @@ function thumbPointerDown(e, from) {
   window.addEventListener('pointerup', up);
 }
 
+// ---------- Getting pages ready to save in the background ----------
+// Each page's full-size JPEG (and its text, for searchable PDFs) is made while
+// you scan the next one, so Save only has to write the file.
+const prepTimers = new Map();
+let prepQueue = Promise.resolve();
+const prepKey = (p) => JSON.stringify([p.rot, p.skew, p.crop, p.adj, p.levels, settings.searchable]);
+function schedulePrep(page, delay = 1500) {
+  clearTimeout(prepTimers.get(page.id));
+  prepTimers.set(page.id, setTimeout(() => { prepQueue = prepQueue.then(() => prepare(page)).catch(() => {}); }, delay));
+}
+async function prepare(page) {
+  if (page.dropped || !state.pages.includes(page) || state.saving) return;
+  const key = prepKey(page);
+  if (page.prepared && page.prepared.key === key) return;
+  await nextFrame();
+  const c = Imaging.render(page, Infinity);
+  const jpeg = new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', page.adj.mode === 'bw' ? 0.9 : 0.85)).arrayBuffer());
+  let words = null;
+  if (settings.searchable) { try { words = await recognise(c, true); } catch {} }
+  const ready = { key, jpeg, width: c.width, height: c.height, words, ocrTried: settings.searchable };
+  c.width = c.height = 0;
+  // Only keep it if nothing changed meanwhile.
+  if (prepKey(page) === key) page.prepared = ready;
+}
+
 const thumbTimers = new Map();
 function refreshThumb(page, delay = 0) {
+  schedulePrep(page);
   clearTimeout(thumbTimers.get(page.id));
   thumbTimers.set(page.id, setTimeout(async () => {
+    if (page.dropped) return;
     const c = Imaging.render(page, 260);
     const blob = await Imaging.toBlob(c, 'image/jpeg', 0.82);
     if (page.thumbUrl) URL.revokeObjectURL(page.thumbUrl);
@@ -371,7 +403,8 @@ function updateMeta() {
   const T = Imaging.turnedSize(p.bitmap, p.rot);
   const w = Math.round(T.w * p.crop.w), h = Math.round(T.h * p.crop.h);
   const skew = Math.abs(p.skew) >= 0.05 ? ` · straightened ${Math.abs(p.skew).toFixed(1)}°` : '';
-  $('pageMeta').textContent = `Page ${state.current + 1} · ${w}×${h} · ${p.dpi} dpi${skew}`;
+  const took = p.scanMs ? ` · scanned in ${(p.scanMs / 1000).toFixed(1)} s` : '';
+  $('pageMeta').textContent = `Page ${state.current + 1} · ${w}×${h} · ${p.dpi} dpi${skew}${took}`;
 }
 
 function scheduleRender() {
@@ -556,17 +589,28 @@ function updateScanBar() {
   if (state.scanning) {
     $('scanLabel').textContent = 'Cancel scan';
     btn.querySelector('.key').textContent = 'Esc';
+  } else if (autoTimer) {
+    $('scanLabel').textContent = `Next scan in ${autoLeft} s`;
+    btn.querySelector('.key').textContent = 'Space: now';
   } else {
     $('scanLabel').textContent = settings.source === 'feeder' ? 'Scan feeder' : `Scan page ${n}`;
     btn.querySelector('.key').textContent = 'Space';
   }
   btn.disabled = state.saving || (!state.scanning && state.devicesLoaded && !currentDevice() && Backend.inApp);
   $('copyBtn').disabled = state.scanning || state.saving || (state.devicesLoaded && !currentDevice() && Backend.inApp);
+  const auto = $('autoBtn');
+  auto.setAttribute('aria-checked', String(settings.auto));
+  auto.hidden = settings.source === 'feeder';
+  $('autoDelay').textContent = `${settings.autoDelay} s`;
+  $('scanHint').textContent = settings.auto && settings.source !== 'feeder'
+    ? 'Auto: after each scan, swap the page — the next scan starts by itself. Esc stops.'
+    : 'Place the next page and press Space. Crop, straighten and your adjustments apply automatically.';
 }
 
 let scanClock = null;
 async function scan({ replace = null, copy = false } = {}) {
   if (state.scanning || state.saving) return;
+  stopAuto();
   const d = currentDevice();
   if (!d) {
     toast('No scanner found. Check it is on and connected.', { bad: true, action: 'Look again', onAction: loadDevices });
@@ -583,50 +627,119 @@ async function scan({ replace = null, copy = false } = {}) {
   $('scanningText').textContent = `${what}…`;
   clearInterval(scanClock);
   scanClock = setInterval(() => { $('scanningText').textContent = `${what}… ${Math.round((Date.now() - started) / 1000)} s`; }, 1000);
+  clearTimeout(releaseTimer);
   renderDevice();
   renderThumbs();
-  try {
-    const source = copy ? 'flatbed' : settings.source;
-    const r = await Backend.scan({ device: d.id, deviceName: d.name, dpi: ps.dpi, intent, source });
-    if (!r.pages.length) throw { code: 'empty', error: 'The scanner sent no pages.' };
-    let blank = 0;
-    const added = [];
-    for (const pg of r.pages) {
-      const bytes = await Backend.readFile(pg.path);
-      Backend.discard(pg.path);
-      const bitmap = await createImageBitmap(new Blob([bytes]));
-      const target = replace && state.pages.includes(replace) && r.pages.length === 1 ? replace : null;
-      const page = await addBitmap(bitmap, pg.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target);
-      // Feeder batches: drop blank sheets (backs of one-sided pages).
-      if (source === 'feeder' && Imaging.isBlank(page)) { removePage(state.pages.indexOf(page), { undoable: false }); blank++; continue; }
-      added.push(page);
-    }
-    if (blank) toast(`Skipped ${blank} blank page${blank === 1 ? '' : 's'}.`);
-    if (copy && added.length) {
-      state.scanning = false;
-      $('scanning').hidden = true;
-      await printPages(added);
-    }
-  } catch (e) {
-    if (e && e.code === 'cancelled') toast('Scan cancelled.');
-    else {
-      toast((e && e.error) || 'Scanning failed.', { bad: true, action: 'Try again', onAction: scan });
-      if (e && (e.code === 'notfound' || e.code === 'offline')) loadDevices();
-    }
-  } finally {
+  const source = copy ? 'flatbed' : settings.source;
+  let files = null, r = null;
+  const done = () => {
     clearInterval(scanClock);
     state.scanning = false;
     $('scanning').hidden = true;
     renderDevice();
     renderThumbs();
+    // Keep the scanner connected for the next page; let go after a quiet spell.
+    releaseTimer = setTimeout(() => Backend.releaseScanner(), 120000);
+  };
+  try {
+    r = await Backend.scan({ device: d.id, deviceName: d.name, dpi: ps.dpi, intent, source });
+    if (!r.pages.length) throw { code: 'empty', error: 'The scanner sent no pages.' };
+    files = [];
+    for (const pg of r.pages) {
+      files.push({ bytes: await Backend.readFile(pg.path), dpi: pg.dpi });
+      Backend.discard(pg.path);
+    }
+  } catch (e) {
+    done();
+    if (e && e.code === 'cancelled') toast('Scan cancelled.');
+    else {
+      toast((e && e.error) || 'Scanning failed.', { bad: true, action: 'Try again', onAction: scan });
+      if (e && (e.code === 'notfound' || e.code === 'offline')) loadDevices();
+    }
+    return;
   }
+  // The scanner is free again: the next scan can start while this page is processed.
+  const scanMs = Date.now() - started;
+  done();
+  const t1 = performance.now();
+  let blank = 0;
+  const added = [];
+  for (const f of files) {
+    const bitmap = await createImageBitmap(new Blob([f.bytes]));
+    const target = replace && state.pages.includes(replace) && files.length === 1 ? replace : null;
+    const page = await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target);
+    page.scanMs = scanMs;
+    // Feeder batches: drop blank sheets (backs of one-sided pages).
+    if (source === 'feeder' && Imaging.isBlank(page)) { removePage(state.pages.indexOf(page), { undoable: false }); blank++; continue; }
+    added.push(page);
+  }
+  updateMeta();
+  console.info(`[Prisca] scan ${scanMs} ms (scanner helper ${r.totalMs} ms, of which setup ${r.setupMs} ms, warm ${r.warm}); processing ${Math.round(performance.now() - t1)} ms`);
+  if (blank) toast(`Skipped ${blank} blank page${blank === 1 ? '' : 's'}.`);
+  if (copy && added.length) { await printPages(added); return; }
+  if (!replace && source === 'flatbed' && autoRunning) afterAutoScan(added[0]);
+}
+
+// ---------- Hands-free: scan again after a countdown ----------
+// With Auto on, each scan starts the next one after a few seconds: swap the
+// page and keep going. Stops on Esc, on an empty glass, or when the same page
+// comes back (not swapped in time).
+let autoTimer = null, autoLeft = 0, autoRunning = false, releaseTimer = null;
+function afterAutoScan(page) {
+  if (!page) return;
+  const i = state.pages.indexOf(page);
+  if (Imaging.isBlank(page)) {
+    removePage(i, { undoable: false });
+    autoRunning = false;
+    toast('Nothing on the glass, so Auto stopped.');
+    return;
+  }
+  const prev = state.pages[i - 1];
+  if (prev && Imaging.samePage(prev, page)) {
+    autoRunning = false;
+    toast('That looks like the same page again, so Auto paused. Put the next page on and press Space.', {
+      action: 'Remove it', duration: 10000, onAction: () => removePage(state.pages.indexOf(page)),
+    });
+    return;
+  }
+  startCountdown();
+}
+function startCountdown() {
+  clearInterval(autoTimer);
+  autoLeft = settings.autoDelay;
+  autoTimer = setInterval(() => {
+    autoLeft--;
+    if (autoLeft <= 0) { clearInterval(autoTimer); autoTimer = null; scan(); return; }
+    updateScanBar();
+  }, 1000);
+  updateScanBar();
+}
+function stopAuto() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  updateScanBar();
 }
 
 function cancelScan() {
   if (state.scanning) Backend.cancel();
 }
 
-$('scanBtn').onclick = () => (state.scanning ? cancelScan() : scan());
+function scanFromUser(opts) {
+  autoRunning = settings.auto && settings.source !== 'feeder';
+  scan(opts);
+}
+$('scanBtn').onclick = () => (state.scanning ? cancelScan() : scanFromUser());
+$('autoBtn').onclick = (e) => {
+  // Clicking the seconds cycles the delay; clicking the rest switches Auto.
+  if (e.target.closest('#autoDelay')) {
+    const steps = [3, 5, 8, 12];
+    settings.autoDelay = steps[(steps.indexOf(settings.autoDelay) + 1) % steps.length];
+  } else {
+    settings.auto = !settings.auto;
+    if (!settings.auto) { autoRunning = false; stopAuto(); }
+  }
+  saveSettings();
+  updateScanBar();
+};
 $('copyBtn').onclick = () => { if (!state.scanning) scan({ copy: true }); };
 $('rescanBtn').onclick = () => { if (cur()) scan({ replace: cur() }); };
 
@@ -697,7 +810,7 @@ $('searchable').onchange = (e) => { settings.searchable = e.target.checked; save
 
 // Text on a page via Windows OCR, as words in the page's own pixels. Null if unavailable.
 let ocrMissingTold = false;
-async function recognise(canvas) {
+async function recognise(canvas, quiet = false) {
   const maxSide = 3000;
   const k = Math.min(1, maxSide / Math.max(canvas.width, canvas.height));
   let src = canvas;
@@ -711,7 +824,7 @@ async function recognise(canvas) {
   if (src !== canvas) src.width = src.height = 0;
   const r = await Backend.ocr(jpeg);
   if (!r || !r.available) {
-    if (Backend.inApp && !ocrMissingTold) {
+    if (Backend.inApp && !ocrMissingTold && !quiet) {
       ocrMissingTold = true;
       toast('Text recognition isn’t set up in Windows (Settings › Time & language › Language › add a language with OCR). Saved without searchable text.', { bad: true });
     }
@@ -775,6 +888,12 @@ async function save(startNew) {
     if (fmt === 'pdf') {
       const parts = [];
       for (let i = 0; i < n; i++) {
+        const ready = pages[i].prepared;
+        if (ready && ready.key === prepKey(pages[i]) && (ready.words || ready.ocrTried || !settings.searchable)) {
+          const [pageW, pageH] = PdfWriter.pageSize(ready.width, ready.height, pages[i].dpi, settings.paper);
+          parts.push({ jpeg: ready.jpeg, width: ready.width, height: ready.height, dpi: pages[i].dpi, words: ready.words, pageW, pageH });
+          continue;
+        }
         toast(`Preparing page ${i + 1} of ${n}…`, { sticky: true });
         await nextFrame();
         const c = Imaging.render(pages[i], Infinity);
@@ -893,11 +1012,15 @@ window.addEventListener('keydown', (e) => {
   }
   if (k === ' ') {
     e.preventDefault();
-    if (!e.repeat && !state.scanning) scan(e.shiftKey && cur() ? { replace: cur() } : {});
+    if (!e.repeat && !state.scanning) {
+      if (e.shiftKey && cur()) scan({ replace: cur() });
+      else scanFromUser();
+    }
     return;
   }
   if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'z') { e.preventDefault(); undoRemove(); return; }
   if (k === 'Escape') {
+    if (autoTimer || autoRunning) { autoRunning = false; stopAuto(); }
     if (state.scanning) cancelScan();
     else if (state.cropping) finishCrop();
     $('deviceMenu').hidden = true;

@@ -291,16 +291,33 @@ function Transfer-Patient($item, [string]$outDir, [string]$stem, [int]$dpi) {
     }
 }
 
+# The scanner stays connected and set up between scans with the same settings,
+# so a batch only pays for connecting once; the next scan goes straight to the
+# transfer. Prisca sends 'release' when it has been idle for a while.
+$script:Ready = @{ key = ''; item = $null; dev = $null; real = 0; minimal = $false }
+$script:NeedsMinimal = @{}
+function Drop-Ready { $script:Ready = @{ key = ''; item = $null; dev = $null; real = 0; minimal = $false } }
+
 function Do-Scan($req) {
+    $t0 = [Diagnostics.Stopwatch]::StartNew()
     New-Item -ItemType Directory -Force -Path $req.out | Out-Null
     $source = if ($req.source) { "$($req.source)" } else { 'flatbed' }
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
-    Log "scan: device=$($req.deviceName) dpi=$($req.dpi) intent=$($req.intent) source=$source"
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $minimal = $attempt -eq 2
-        $dev = Connect-Device "$($req.device)" "$($req.deviceName)"
-        $item = Pick-Item $dev $source
-        $real = Configure-Item $dev $item ([int]$req.dpi) "$($req.intent)" -Minimal:$minimal
+    $key = "$($req.device)|$($req.deviceName)|$source|$($req.dpi)|$($req.intent)"
+    Log "scan: device=$($req.deviceName) dpi=$($req.dpi) intent=$($req.intent) source=$source warm=$($script:Ready.key -eq $key)"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $warm = ($attempt -eq 1 -and $script:Ready.key -eq $key -and $script:Ready.item)
+        if ($warm) {
+            $item = $script:Ready.item; $real = $script:Ready.real; $minimal = $script:Ready.minimal
+        } else {
+            Drop-Ready
+            $minimal = [bool]$script:NeedsMinimal["$($req.device)"] -or ($attempt -eq 3)
+            $dev = Connect-Device "$($req.device)" "$($req.deviceName)"
+            $item = Pick-Item $dev $source
+            $real = Configure-Item $dev $item ([int]$req.dpi) "$($req.intent)" -Minimal:$minimal
+            $script:Ready = @{ key = $key; item = $item; dev = $dev; real = $real; minimal = $minimal }
+        }
+        $setupMs = $t0.ElapsedMilliseconds
         $pages = @()
         try {
             if ($source -eq 'feeder') {
@@ -315,14 +332,26 @@ function Do-Scan($req) {
             } else {
                 $pages += (Transfer-Patient $item $req.out "scan-$stamp" $real)
             }
-            return @{ pages = $pages; dpi = $real; simple = $minimal }
+            $total = $t0.ElapsedMilliseconds
+            Log "scan done: setup=${setupMs}ms total=${total}ms warm=$warm"
+            return @{ pages = $pages; dpi = $real; simple = $minimal; setupMs = $setupMs; totalMs = $total; warm = [bool]$warm }
         } catch {
             $d = Describe-Error $_
-            # The driver didn't like the settings: try once more with its own defaults
-            # (Prisca makes grey and black-and-white itself, so colour is fine).
-            if ($attempt -eq 1 -and $pages.Count -eq 0 -and $d.code -in @('setting', 'unsupported', 'unknown', 'general')) {
-                Log "scan failed with our settings ($($d.code) $($d.hresult)); retrying with the driver's defaults"
-                $dev = $null; $item = $null; [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+            Drop-Ready
+            if ($pages.Count -gt 0 -or $d.code -in @('cancelled', 'empty', 'jam', 'cover', 'multifeed', 'locked', 'attention')) { throw }
+            if ($warm) {
+                # The kept connection went stale (printer slept, re-plugged): connect afresh.
+                Log "kept connection failed ($($d.code) $($d.hresult)); reconnecting"
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                $attempt = 1; $script:Ready.key = '__retry__'
+                continue
+            }
+            if (-not $minimal -and $d.code -in @('setting', 'unsupported', 'unknown', 'general')) {
+                # The driver didn't like our settings: use its own defaults from now on
+                # (Prisca makes grey and black-and-white itself, so colour is fine).
+                Log "scan failed with our settings ($($d.code) $($d.hresult)); using the driver's defaults"
+                $script:NeedsMinimal["$($req.device)"] = $true
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
                 continue
             }
             throw
@@ -409,7 +438,8 @@ while ($true) {
         $id = $req.id
         switch ($req.cmd) {
             'devices' { Write-Reply @{ id = $id; ok = $true; devices = (Get-Devices) } }
-            'scan'    { $r = Do-Scan $req; Write-Reply @{ id = $id; ok = $true; pages = $r.pages; dpi = $r.dpi; simple = $r.simple } }
+            'scan'    { $r = Do-Scan $req; Write-Reply @{ id = $id; ok = $true; pages = $r.pages; dpi = $r.dpi; simple = $r.simple; setupMs = $r.setupMs; totalMs = $r.totalMs; warm = $r.warm } }
+            'release' { Drop-Ready; Write-Reply @{ id = $id; ok = $true } }
             'probe'   { Write-Reply @{ id = $id; ok = $true; probe = (Do-Probe $req) } }
             'ocr'     { $r = Do-Ocr "$($req.path)"; Write-Reply @{ id = $id; ok = $true; available = $r.available; language = $r.language; lines = $r.lines; max = $r.max } }
             'ping'    { Write-Reply @{ id = $id; ok = $true } }

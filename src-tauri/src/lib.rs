@@ -8,6 +8,8 @@ use tauri::{Manager, State};
 
 struct AppState {
     scanner: Scanner,
+    /// A second helper for text recognition, so reading a page never holds up the next scan.
+    reader: Scanner,
     scan_dir: PathBuf,
 }
 
@@ -55,7 +57,7 @@ async fn ocr_page(app: tauri::AppHandle, request: Request<'_>) -> Result<Value, 
         let n = OCR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = s.scan_dir.join(format!("ocr-{n}.jpg"));
         std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        let r = s.scanner.request(json!({ "cmd": "ocr", "path": path.to_string_lossy() }), secs(90));
+        let r = s.reader.request(json!({ "cmd": "ocr", "path": path.to_string_lossy() }), secs(90));
         let _ = std::fs::remove_file(&path);
         r
     })
@@ -71,6 +73,12 @@ async fn cancel_scan(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().scanner.cancel())
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Lets go of the scanner after a quiet spell (it stays connected between scans in a batch).
+#[tauri::command]
+async fn release_scanner(app: tauri::AppHandle) -> Result<(), String> {
+    blocking(app, |s| s.scanner.request(json!({ "cmd": "release" }), secs(20)).map(|_| ())).await
 }
 
 /// Everything the scanner's driver reports about itself (for diagnosing odd scanners).
@@ -246,7 +254,7 @@ pub fn run() {
             // Leftovers from last time.
             let _ = std::fs::remove_dir_all(&scan_dir);
             let _ = std::fs::create_dir_all(&scan_dir);
-            app.manage(AppState { scanner: Scanner::new(cache), scan_dir });
+            app.manage(AppState { scanner: Scanner::new(cache.clone()), reader: Scanner::new(cache), scan_dir });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -255,6 +263,7 @@ pub fn run() {
             ocr_page,
             cancel_scan,
             probe_scanner,
+            release_scanner,
             scanner_log_path,
             read_file,
             discard_scan,
