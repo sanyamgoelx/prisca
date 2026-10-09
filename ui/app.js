@@ -30,6 +30,7 @@ function loadSettings() {
     searchable: s.searchable !== false,
     paper: ['auto', 'a4', 'letter', 'actual'].includes(s.paper) ? s.paper : 'auto',
     auto: !!s.auto,
+    upright: s.upright !== false,
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     presets,
   };
@@ -220,6 +221,7 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null) {
   renderThumbs();
   refreshThumb(page);
   showPage();
+  if (at < 0) queueUpright(page);
   return page;
 }
 
@@ -403,7 +405,7 @@ function updateMeta() {
   const T = Imaging.turnedSize(p.bitmap, p.rot);
   const w = Math.round(T.w * p.crop.w), h = Math.round(T.h * p.crop.h);
   const skew = Math.abs(p.skew) >= 0.05 ? ` · straightened ${Math.abs(p.skew).toFixed(1)}°` : '';
-  const took = p.scanMs ? ` · scanned in ${(p.scanMs / 1000).toFixed(1)} s` : '';
+  const took = (p.autoTurned ? ' · turned upright' : '') + (p.scanMs ? ` · scanned in ${(p.scanMs / 1000).toFixed(1)} s` : '');
   $('pageMeta').textContent = `Page ${state.current + 1} · ${w}×${h} · ${p.dpi} dpi${skew}${took}`;
 }
 
@@ -528,14 +530,71 @@ $('cropBox').addEventListener('pointerdown', (e) => {
 // ---------- Rotate / remove ----------
 function rotate(dir) {
   const p = cur(); if (!p) return;
+  p.userRotated = true;
+  rotatePage(p, dir);
+}
+function rotatePage(p, dir) {
   const c = p.crop;
   p.crop = dir > 0
     ? { x: 1 - (c.y + c.h), y: c.x, w: c.h, h: c.w }
     : { x: c.y, y: 1 - (c.x + c.w), w: c.h, h: c.w };
   p.rot = (p.rot + (dir > 0 ? 90 : 270)) % 360;
   refreshThumb(p);
-  updateMeta();
-  scheduleRender();
+  if (p === cur()) { updateMeta(); scheduleRender(); }
+}
+
+// ---------- Turning pages upright ----------
+// Reads the page at each quarter turn (Windows OCR, in the background helper)
+// and keeps the turn where real words come out. Runs before the page is
+// prepared for saving; never overrides a turn you made yourself.
+let uprightUnavailable = false;
+function queueUpright(page) {
+  if (!settings.upright || uprightUnavailable || !Backend.inApp && !window.PRISCA_MOCK_UPRIGHT) return;
+  prepQueue = prepQueue.then(() => uprightPage(page)).catch(() => {});
+}
+async function uprightPage(page) {
+  if (page.dropped || page.userRotated || !state.pages.includes(page)) return;
+  const base = Imaging.geometry(page.bitmap, { rot: page.rot, skew: page.skew, crop: page.crop, maxDim: 1600 });
+  Imaging.tone(base, { mode: 'grey', auto: true, brightness: 0, contrast: 10, sharpness: 0, threshold: 50 }, page.levels);
+  const scores = [];
+  for (const turn of [0, 1, 2, 3]) {
+    const c = turnCanvas(base, turn);
+    const jpeg = new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', 0.85)).arrayBuffer());
+    let r = null;
+    try { r = await Backend.ocr(jpeg); } catch { r = null; }
+    if (!r || !r.available) { uprightUnavailable = !r || !r.available; return; }
+    scores.push(wordScore(r));
+    // Clearly upright already: no need to try the other turns.
+    if (turn === 0 && scores[0] >= 40) break;
+  }
+  if (page.dropped || page.userRotated) return;
+  let best = 0;
+  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
+  console.info(`[Prisca] upright scores ${scores.join('/')} -> turn ${best * 90}`);
+  if (best === 0 || scores[best] < 5 || scores[best] < scores[0] * 2 + 2) return;
+  for (let i = 0; i < best; i++) rotatePage(page, 1);
+  page.autoTurned = best * 90;
+  if (page === cur()) updateMeta();
+}
+function turnCanvas(src, turn) {
+  if (!turn) return src;
+  const w = turn % 2 ? src.height : src.width, h = turn % 2 ? src.width : src.height;
+  const c = Imaging.makeCanvas(w, h);
+  const g = c.getContext('2d');
+  g.translate(w / 2, h / 2);
+  g.rotate((turn * Math.PI) / 2);
+  g.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+// Real words: three or more letters (upside-down or sideways text reads as junk).
+function wordScore(r) {
+  const lines = Array.isArray(r.lines) ? r.lines : r.lines ? [r.lines] : [];
+  let n = 0;
+  for (const line of lines) {
+    const ws = Array.isArray(line.words) ? line.words : line.words ? [line.words] : [];
+    for (const w of ws) if (/^[A-Za-z][a-z]{2,}$|^[A-Z]{3,}$/.test(String(w.t).replace(/[.,:;!?)(]+$/g, ''))) n++;
+  }
+  return n;
 }
 $('rotL').onclick = () => rotate(-1);
 $('rotR').onclick = () => rotate(1);
@@ -806,6 +865,8 @@ function renderFormat() {
   updateSaveLabel();
 }
 $('paper').onchange = (e) => { settings.paper = e.target.value; saveSettings(); };
+$('upright').checked = settings.upright;
+$('upright').onchange = (e) => { settings.upright = e.target.checked; saveSettings(); };
 $('searchable').onchange = (e) => { settings.searchable = e.target.checked; saveSettings(); };
 
 // Text on a page via Windows OCR, as words in the page's own pixels. Null if unavailable.

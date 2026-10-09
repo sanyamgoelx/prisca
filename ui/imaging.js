@@ -261,15 +261,41 @@ const Imaging = (() => {
     // A nearly flat picture (blank sheet, empty glass): keep it light, not stretched to black.
     if (hi - lo < 60) { lo = Math.max(0, hi - 120); }
     const out = { lo, hi };
-    if (kind !== 'photo') {
-      // Paper colour per channel, so cream or grey paper turns white in colour scans.
+    // Paper colour per channel, so cream, grey or tinted paper turns white in colour scans.
+    const paperOf = () => {
       const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
       const hc = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
       for (let j = 0; j < d.length; j += 4) {
         if (((d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8) < peakOf(hist) - 12) continue;
         hc[0][d[j]]++; hc[1][d[j + 1]]++; hc[2][d[j + 2]]++;
       }
-      out.paper = hc.map((hh) => { let pk = 128, pc = 0; for (let v = 128; v < 256; v++) if (hh[v] > pc) { pc = hh[v]; pk = v; } return pc ? Math.max(lo + 60, pk - 6) : hi; });
+      return hc.map((hh) => { let pk = 128, pc = 0; for (let v = 128; v < 256; v++) if (hh[v] > pc) { pc = hh[v]; pk = v; } return pc ? Math.max(lo + 60, pk - 6) : hi; });
+    };
+    // Mostly bare paper (a document scanned with the Photo preset)?
+    const pk = peakOf(hist);
+    let near = 0;
+    for (let v = Math.max(0, pk - 12); v <= Math.min(255, pk + 12); v++) near += hist[v];
+    const documentLike = pk >= 170 && near / L.length > 0.3;
+    if (kind !== 'photo' || documentLike) {
+      out.paper = paperOf();
+    } else {
+      // Photos: neutralise a colour cast (some scanners tint white paper,
+      // e.g. lavender) using the brightest part of the picture as white,
+      // but only gently, so a real photo keeps its colours.
+      const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
+      const cut = pct(0.93);
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let j = 0; j < d.length; j += 4) {
+        if (((d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8) < cut) continue;
+        r += d[j]; g += d[j + 1]; b += d[j + 2]; n++;
+      }
+      if (n) {
+        const ref = [r / n, g / n, b / n];
+        const mean = (ref[0] + ref[1] + ref[2]) / 3;
+        if (mean > 170) {
+          out.paper = ref.map((c) => Math.round(hi * Math.min(1.12, Math.max(0.88, c / mean))));
+        }
+      }
     }
     return out;
   }

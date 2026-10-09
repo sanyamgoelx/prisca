@@ -4,3 +4,4 @@ src-tauri/gen/schemas/
 *.log
 test-files/
 dist/
+speed-test.log

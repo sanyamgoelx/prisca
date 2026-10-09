@@ -359,6 +359,59 @@ function Do-Scan($req) {
     }
 }
 
+# Speed test: the same scanner, several settings, timed. Finds what makes this
+# scanner faster (resolution, colour, scanning less of the glass, preview mode).
+function Do-Bench($req) {
+    New-Item -ItemType Directory -Force -Path $req.out | Out-Null
+    Drop-Ready
+    $results = @()
+    $dev = Connect-Device "$($req.device)" "$($req.deviceName)"
+    $item = Pick-Item $dev 'flatbed'
+    $n = 0
+    foreach ($run in $req.runs) {
+        $n++
+        $r = @{ label = "$($run.label)"; dpi = [int]$run.dpi; intent = "$($run.intent)"; height = [double]$run.height; preview = [int]$run.preview }
+        try {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $real = Configure-Item $dev $item ([int]$run.dpi) "$($run.intent)"
+            if ([double]$run.height -lt 1) {
+                $p = Find-Prop $item.Properties $P_YEXT
+                if ($p) { [void](Set-Prop $item.Properties $P_YEXT ([int][Math]::Floor([int]$p.Value * [double]$run.height))) }
+            }
+            $r.previewSet = $false
+            if ([int]$run.preview -eq 1) {
+                if (Set-Prop $item.Properties 3100 1) { $r.previewSet = $true }
+                elseif (Set-Prop $dev.Properties 3100 1) { $r.previewSet = $true }
+            } else {
+                [void](Set-Prop $item.Properties 3100 0); [void](Set-Prop $dev.Properties 3100 0)
+            }
+            $r.setupMs = $sw.ElapsedMilliseconds
+            $f = Transfer-One $item $req.out "bench-$n" $real
+            $r.scanMs = $sw.ElapsedMilliseconds - $r.setupMs
+            $r.size = "$($f.width)x$($f.height)"
+            $r.bytes = (Get-Item $f.path).Length
+            Remove-Item $f.path -Force -ErrorAction SilentlyContinue
+            $r.ok = $true
+        } catch {
+            $d = Describe-Error $_
+            $r.ok = $false; $r.error = "$($d.code) $($d.hresult) $($d.error)"
+        }
+        Log ("bench: " + ($r | ConvertTo-Json -Compress))
+        $results += $r
+    }
+    # Driver properties that might matter for speed.
+    $speedProps = @()
+    foreach ($set in @(@('device', $dev.Properties), @('item', $item.Properties))) {
+        foreach ($p in $set[1]) {
+            if ("$($p.Name)" -match 'preview|speed|quality|warm|lamp|mode|compression|buffer|transfer|format|filter') {
+                $v = ''; try { $v = "$($p.Value)" } catch {}
+                $speedProps += @{ where = $set[0]; id = $p.PropertyID; name = "$($p.Name)"; value = $v; ro = $p.IsReadOnly }
+            }
+        }
+    }
+    return @{ results = $results; props = $speedProps }
+}
+
 # Everything the driver says about itself, for diagnosing odd scanners.
 function Dump-Props($props) {
     $o = @()
@@ -441,6 +494,7 @@ while ($true) {
             'scan'    { $r = Do-Scan $req; Write-Reply @{ id = $id; ok = $true; pages = $r.pages; dpi = $r.dpi; simple = $r.simple; setupMs = $r.setupMs; totalMs = $r.totalMs; warm = $r.warm } }
             'release' { Drop-Ready; Write-Reply @{ id = $id; ok = $true } }
             'probe'   { Write-Reply @{ id = $id; ok = $true; probe = (Do-Probe $req) } }
+            'bench'   { $b = Do-Bench $req; Write-Reply @{ id = $id; ok = $true; results = $b.results; props = $b.props } }
             'ocr'     { $r = Do-Ocr "$($req.path)"; Write-Reply @{ id = $id; ok = $true; available = $r.available; language = $r.language; lines = $r.lines; max = $r.max } }
             'ping'    { Write-Reply @{ id = $id; ok = $true } }
             default   { Write-Reply @{ id = $id; ok = $false; code = 'badcmd'; error = "Unknown command $($req.cmd)" } }
