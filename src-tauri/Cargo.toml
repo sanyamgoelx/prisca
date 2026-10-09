@@ -1,6 +1,6 @@
 [package]
 name = "prisca"
-version = "0.1.2"
+version = "0.1.3"
 description = "Prisca: fast scanning for any WIA scanner or all-in-one printer"
 license = "GPL-3.0-or-later"
 authors = ["Crofty"]

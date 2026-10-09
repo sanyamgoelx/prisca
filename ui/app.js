@@ -31,6 +31,7 @@ function loadSettings() {
     paper: ['auto', 'a4', 'letter', 'actual'].includes(s.paper) ? s.paper : 'auto',
     auto: !!s.auto,
     upright: s.upright !== false,
+    cast: s.cast && typeof s.cast === 'object' ? s.cast : {},
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     presets,
   };
@@ -202,10 +203,14 @@ function newPage(bitmap, dpi, presetKey) {
   };
 }
 
-async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null) {
+async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, device = null) {
   const page = newPage(bitmap, dpi, presetKey);
   page.scannedGrey = !!scannedGrey;
+  // What this scanner does to white paper (learnt from earlier document scans),
+  // so pictures without much white get the same colour correction.
+  page.deviceCast = device && settings.cast[device] ? settings.cast[device] : null;
   Imaging.analyse(page);
+  if (device && !scannedGrey && page.levels && page.levels.documentLike && page.levels.cast) learnCast(device, page.levels.cast);
   const at = replace ? state.pages.indexOf(replace) : -1;
   if (at >= 0) {
     page.adj = { ...replace.adj };
@@ -223,6 +228,12 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null) {
   showPage();
   if (at < 0) queueUpright(page);
   return page;
+}
+
+function learnCast(device, cast) {
+  const old = settings.cast[device];
+  settings.cast[device] = old ? old.map((v, k) => Math.round((v * 0.7 + cast[k] * 0.3) * 10) / 10) : cast.slice();
+  saveSettings();
 }
 
 function selectPage(i) {
@@ -726,7 +737,7 @@ async function scan({ replace = null, copy = false } = {}) {
   for (const f of files) {
     const bitmap = await createImageBitmap(new Blob([f.bytes]));
     const target = replace && state.pages.includes(replace) && files.length === 1 ? replace : null;
-    const page = await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target);
+    const page = await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target, d.name);
     page.scanMs = scanMs;
     // Feeder batches: drop blank sheets (backs of one-sided pages).
     if (source === 'feeder' && Imaging.isBlank(page)) { removePage(state.pages.indexOf(page), { undoable: false }); blank++; continue; }

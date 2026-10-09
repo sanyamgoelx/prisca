@@ -239,7 +239,7 @@ const Imaging = (() => {
   // ---------- Levels ----------
   // Black and white points for auto-enhance. Documents push the paper to white;
   // photos only stretch the ends.
-  function detectLevels(canvas, kind) {
+  function detectLevels(canvas, kind, deviceCast) {
     const { L } = greyOf(canvas);
     const hist = new Uint32Array(256);
     for (let i = 0; i < L.length; i++) hist[L[i]]++;
@@ -261,42 +261,49 @@ const Imaging = (() => {
     // A nearly flat picture (blank sheet, empty glass): keep it light, not stretched to black.
     if (hi - lo < 60) { lo = Math.max(0, hi - 120); }
     const out = { lo, hi };
-    // Paper colour per channel, so cream, grey or tinted paper turns white in colour scans.
-    const paperOf = () => {
-      const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
-      const hc = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
-      for (let j = 0; j < d.length; j += 4) {
-        if (((d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8) < peakOf(hist) - 12) continue;
-        hc[0][d[j]]++; hc[1][d[j + 1]]++; hc[2][d[j + 2]]++;
-      }
-      return hc.map((hh) => { let pk = 128, pc = 0; for (let v = 128; v < 256; v++) if (hh[v] > pc) { pc = hh[v]; pk = v; } return pc ? Math.max(lo + 60, pk - 6) : hi; });
-    };
-    // Mostly bare paper (a document scanned with the Photo preset)?
+    // Colour cast: scanners (HP inkjets especially) tint white paper, e.g. lavender.
+    // Gains per channel make the paper neutral again. This is colour correction,
+    // not enhancement: it applies with Auto-enhance on or off.
+    const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
     const pk = peakOf(hist);
     let near = 0;
     for (let v = Math.max(0, pk - 12); v <= Math.min(255, pk + 12); v++) near += hist[v];
-    const documentLike = pk >= 170 && near / L.length > 0.3;
-    if (kind !== 'photo' || documentLike) {
-      out.paper = paperOf();
+    // Mostly bare paper: a document, whatever preset it was scanned with.
+    const documentLike = pk >= 150 && near / L.length > 0.25;
+    let ref = null;
+    if (documentLike) {
+      // The paper's own colour: the peak of each channel among paper pixels.
+      const hc = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+      for (let j = 0; j < d.length; j += 4) {
+        const l = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+        if (l < pk - 14 || l > pk + 14) continue;
+        hc[0][d[j]]++; hc[1][d[j + 1]]++; hc[2][d[j + 2]]++;
+      }
+      ref = hc.map((hh) => { let p = 0, c = 0; for (let v = 0; v < 256; v++) if (hh[v] > c) { c = hh[v]; p = v; } return p || 1; });
     } else {
-      // Photos: neutralise a colour cast (some scanners tint white paper,
-      // e.g. lavender) using the brightest part of the picture as white,
-      // but only gently, so a real photo keeps its colours.
-      const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
-      const cut = pct(0.93);
+      // Pictures: the brightest few percent stand in for white.
+      const cut = pct(0.95);
       let r = 0, g = 0, b = 0, n = 0;
       for (let j = 0; j < d.length; j += 4) {
         if (((d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8) < cut) continue;
         r += d[j]; g += d[j + 1]; b += d[j + 2]; n++;
       }
-      if (n) {
-        const ref = [r / n, g / n, b / n];
-        const mean = (ref[0] + ref[1] + ref[2]) / 3;
-        if (mean > 170) {
-          out.paper = ref.map((c) => Math.round(hi * Math.min(1.12, Math.max(0.88, c / mean))));
-        }
-      }
+      if (n) ref = [r / n, g / n, b / n];
     }
+    // Scanner casts behave like a constant shift per channel (measured on an HP
+    // Deskjet 1515: paper +3/-9/+7, mid greys +1/-10/+9, dark greys +2/-6/+5),
+    // so the correction subtracts the paper's offset from neutral rather than
+    // scaling, which left mid greys lavender.
+    const offsFrom = (rf, lim) => {
+      const m = (rf[0] + rf[1] + rf[2]) / 3;
+      return rf.map((c) => Math.round(Math.min(lim, Math.max(-lim, c - m)) * 10) / 10);
+    };
+    if (documentLike && ref) out.cast = offsFrom(ref, 40);
+    else if (deviceCast) out.cast = deviceCast.slice(); // what this scanner does to white paper
+    // Pictures: only when their brightest part is close to white already (a tinted
+    // white, not a coloured subject).
+    else if (ref && (ref[0] + ref[1] + ref[2]) / 3 > 170 && Math.max(...ref) - Math.min(...ref) < 30) out.cast = offsFrom(ref, 8);
+    out.documentLike = documentLike;
     return out;
   }
 
@@ -307,12 +314,12 @@ const Imaging = (() => {
   }
 
   // ---------- Tone ----------
-  function buildLut(adj, levels, hiOverride) {
+  function buildLut(adj, levels) {
     const lut = new Uint8ClampedArray(256);
     const C = adj.contrast * 2.55;
     const f = (259 * (C + 255)) / (255 * (259 - C));
     const lo = adj.auto && levels ? levels.lo : 0;
-    const hi = adj.auto && levels ? (hiOverride || levels.hi) : 255;
+    const hi = adj.auto && levels ? levels.hi : 255;
     for (let v = 0; v < 256; v++) {
       let x = ((v - lo) * 255) / Math.max(1, hi - lo);
       x += adj.brightness * 1.28;
@@ -342,10 +349,15 @@ const Imaging = (() => {
       }
       for (let i = 0, j = 0; i < L.length; i++, j += 4) { d[j] = d[j + 1] = d[j + 2] = L[i]; d[j + 3] = 255; }
     } else {
-      const paper = adj.auto && levels && levels.paper;
-      const lr = paper ? buildLut(adj, levels, paper[0]) : lut;
-      const lg = paper ? buildLut(adj, levels, paper[1]) : lut;
-      const lb = paper ? buildLut(adj, levels, paper[2]) : lut;
+      // Remove the scanner's colour cast first (always), then the tone curve.
+      const cast = (levels && levels.cast) || [0, 0, 0];
+      const ch = cast.map((o) => {
+        const l = new Uint8ClampedArray(256);
+        // Full shift from mid-dark up; fades out towards black so black stays black.
+        for (let v = 0; v < 256; v++) l[v] = lut[Math.min(255, Math.max(0, Math.round(v - o * Math.min(1, v / 64))))];
+        return l;
+      });
+      const [lr, lg, lb] = ch;
       for (let j = 0; j < d.length; j += 4) { d[j] = lr[d[j]]; d[j + 1] = lg[d[j + 1]]; d[j + 2] = lb[d[j + 2]]; }
       if (amount > 0.01) sharpenRGBA(d, w, h, amount);
     }
@@ -390,7 +402,7 @@ const Imaging = (() => {
 
   function refreshLevels(page) {
     const c = geometry(page.bitmap, { rot: page.rot, skew: page.skew, crop: page.crop, maxDim: 600 });
-    page.levels = detectLevels(c, page.kind);
+    page.levels = detectLevels(c, page.kind, page.deviceCast);
   }
 
   // Straighten + crop + levels for a new page.
@@ -443,5 +455,132 @@ const Imaging = (() => {
     return r > 0.975;
   }
 
-  return { isBlank, samePage, geometry, turnedSize, detectSkew, detectCrop, detectLevels, refreshLevels, analyse, render, tone, toBlob, makeCanvas };
+  // ---------- Several items on the glass ----------
+  // Receipts, cards or photos laid side by side: finds each one and cuts it out
+  // (with some lid around it, so the normal straighten + crop still runs on it).
+  // Returns [bitmap] unchanged when there is only one thing on the glass.
+  async function splitItems(src) {
+    const g = greyOf(geometry(src, { maxDim: 600 }));
+    const { L, w, h } = g;
+    const bx = Math.round(w * 0.02), by = Math.round(h * 0.02);
+    // Lid colour: the median of a band just inside the bed's border.
+    const ring = [];
+    for (let x = bx; x < w - bx; x += 3) { ring.push(L[by * w + x], L[(h - by - 1) * w + x]); }
+    for (let y = by; y < h - by; y += 3) { ring.push(L[y * w + bx], L[y * w + w - bx - 1]); }
+    ring.sort((a, b) => a - b);
+    const lid = ring[ring.length >> 1];
+    const B = blur3(L, w, h);
+    const mask = new Uint8Array(w * h);
+    for (let y = by + 1; y < h - by - 1; y++) {
+      for (let x = bx + 1; x < w - bx - 1; x++) {
+        const i = y * w + x;
+        const grad = Math.abs(B[i + 1] - B[i - 1]) + Math.abs(B[i + w] - B[i - w]);
+        if (Math.abs(B[i] - lid) > 14 || grad > 10) mask[i] = 1;
+      }
+    }
+    // Join each item's text and edges into one blob.
+    const r = Math.max(2, Math.round(Math.max(w, h) * 0.012));
+    const grown = dilate(mask, w, h, r);
+    const comps = components(grown, w, h);
+    const minArea = w * h * 0.012;
+    let boxes = comps.filter((c) => c.area >= minArea).map((c) => ({
+      x0: Math.max(0, c.x0 + r), y0: Math.max(0, c.y0 + r), x1: Math.min(w - 1, c.x1 - r), y1: Math.min(h - 1, c.y1 - r),
+    })).filter((b) => b.x1 > b.x0 && b.y1 > b.y0);
+    if (boxes.length < 2) return [src];
+    // Reading order: rows top to bottom, then left to right.
+    boxes.sort((a, b) => (Math.abs(a.y0 - b.y0) < h * 0.08 ? a.x0 - b.x0 : a.y0 - b.y0));
+    const sx = src.width / w, sy = src.height / h;
+    const pad = Math.round(Math.max(w, h) * 0.015);
+    const out = [];
+    for (const b of boxes) {
+      const x = Math.max(0, (b.x0 - pad) * sx), y = Math.max(0, (b.y0 - pad) * sy);
+      const x2 = Math.min(src.width, (b.x1 + pad + 1) * sx), y2 = Math.min(src.height, (b.y1 + pad + 1) * sy);
+      out.push(await createImageBitmap(src, Math.round(x), Math.round(y), Math.round(x2 - x), Math.round(y2 - y)));
+    }
+    return out;
+  }
+
+  // ---------- Book spreads ----------
+  // Two facing pages: splits at the gutter (the shadow or empty band between
+  // the pages), across whichever way the spread lies on the glass.
+  async function splitBook(src) {
+    const g = greyOf(geometry(src, { maxDim: 600 }));
+    const { L, w, h } = g;
+    // Where the book is: the box of everything that isn't plain lid.
+    const crop = detectCrop(src, 0, 0);
+    const x0 = Math.round(crop.x * w), y0 = Math.round(crop.y * h);
+    const x1 = Math.round((crop.x + crop.w) * w), y1 = Math.round((crop.y + crop.h) * h);
+    const vertical = (x1 - x0) >= (y1 - y0); // pages side by side
+    const len = vertical ? x1 - x0 : y1 - y0;
+    if (len < 40) return [src];
+    // Darkness profile across the book; the gutter is the darkest (shadow) or
+    // emptiest band in the middle third.
+    const prof = new Float64Array(len);
+    for (let k = 0; k < len; k++) {
+      let s = 0, n = 0;
+      if (vertical) { for (let y = y0; y < y1; y += 2) { s += L[y * w + x0 + k]; n++; } }
+      else { for (let x = x0; x < x1; x += 2) { s += L[(y0 + k) * w + x]; n++; } }
+      prof[k] = s / Math.max(1, n);
+    }
+    const from = Math.round(len / 3), to = Math.round((len * 2) / 3);
+    let mean = 0;
+    for (let k = from; k < to; k++) mean += prof[k];
+    mean /= Math.max(1, to - from);
+    // A shadow line (clearly darker than its surroundings) wins; else the middle.
+    let best = Math.round(len / 2), bestV = Infinity;
+    for (let k = from + 2; k < to - 2; k++) {
+      const v = (prof[k - 2] + prof[k - 1] + prof[k] + prof[k + 1] + prof[k + 2]) / 5;
+      if (v < bestV) { bestV = v; best = k; }
+    }
+    if (bestV > mean - 6) best = Math.round(len / 2);
+    const cut = (vertical ? x0 : y0) + best;
+    const sx = src.width / w, sy = src.height / h;
+    if (vertical) {
+      const c = Math.round(cut * sx);
+      return [await createImageBitmap(src, 0, 0, c, src.height), await createImageBitmap(src, c, 0, src.width - c, src.height)];
+    }
+    const c = Math.round(cut * sy);
+    return [await createImageBitmap(src, 0, 0, src.width, c), await createImageBitmap(src, 0, c, src.width, src.height - c)];
+  }
+
+  function dilate(m, w, h, r) {
+    // Separable max filter (square), fast enough at this size.
+    const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let last = -1e9;
+      for (let x = 0; x < w; x++) { if (m[y * w + x]) last = x; if (x - last <= r) tmp[y * w + x] = 1; }
+      last = 1e9;
+      for (let x = w - 1; x >= 0; x--) { if (m[y * w + x]) last = x; if (last - x <= r) tmp[y * w + x] = 1; }
+    }
+    for (let x = 0; x < w; x++) {
+      let last = -1e9;
+      for (let y = 0; y < h; y++) { if (tmp[y * w + x]) last = y; if (y - last <= r) out[y * w + x] = 1; }
+      last = 1e9;
+      for (let y = h - 1; y >= 0; y--) { if (tmp[y * w + x]) last = y; if (last - y <= r) out[y * w + x] = 1; }
+    }
+    return out;
+  }
+
+  function components(m, w, h) {
+    const label = new Int32Array(w * h).fill(-1);
+    const out = [];
+    const stack = [];
+    for (let i = 0; i < w * h; i++) {
+      if (!m[i] || label[i] >= 0) continue;
+      const c = { area: 0, x0: w, y0: h, x1: 0, y1: 0 };
+      label[i] = out.length; stack.push(i);
+      while (stack.length) {
+        const j = stack.pop();
+        const x = j % w, y = (j / w) | 0;
+        c.area++;
+        if (x < c.x0) c.x0 = x; if (x > c.x1) c.x1 = x; if (y < c.y0) c.y0 = y; if (y > c.y1) c.y1 = y;
+        const nb = [x > 0 ? j - 1 : -1, x < w - 1 ? j + 1 : -1, y > 0 ? j - w : -1, y < h - 1 ? j + w : -1];
+        for (const k of nb) if (k >= 0 && m[k] && label[k] < 0) { label[k] = out.length; stack.push(k); }
+      }
+      out.push(c);
+    }
+    return out;
+  }
+
+  return { splitItems, splitBook, isBlank, samePage, geometry, turnedSize, detectSkew, detectCrop, detectLevels, refreshLevels, analyse, render, tone, toBlob, makeCanvas };
 })();

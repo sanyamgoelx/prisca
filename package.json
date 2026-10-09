@@ -1,6 +1,6 @@
 {
   "name": "prisca",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Prisca: fast scanning for any WIA scanner or all-in-one printer",
   "author": "Crofty",
