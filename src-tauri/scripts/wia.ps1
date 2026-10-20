@@ -4,6 +4,7 @@
 # Protocol: one JSON request per line on stdin, one JSON reply per line on stdout.
 #   {"id":1,"cmd":"devices"}
 #   {"id":2,"cmd":"scan","device":"<DeviceID>","dpi":200,"intent":"grey","source":"flatbed","out":"C:\\...\\scans"}
+#   {"id":3,"cmd":"printers"} / {"id":4,"cmd":"printer","name":"..","paper":9} / {"id":5,"cmd":"print","job":{..}}
 # Replies: {"id":1,"ok":true,...} or {"id":1,"ok":false,"error":"...","code":"..."}
 
 $ErrorActionPreference = 'Stop'
@@ -479,6 +480,161 @@ function Do-Ocr([string]$path) {
     return @{ available = $true; language = "$($engine.RecognizerLanguage.LanguageTag)"; lines = $lines; max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension }
 }
 
+# ---------- Printing ----------
+# The window lays out each sheet in mm; this draws every picture at exactly that
+# place with System.Drawing.Printing (any Windows printer, no dialog).
+$script:DrawingReady = $false
+function Init-Drawing {
+    if ($script:DrawingReady) { return }
+    Add-Type -AssemblyName System.Drawing
+    $script:DrawingReady = $true
+}
+$HUNDREDTH_MM = 0.254   # 1/100 inch in mm
+
+function Get-Printers {
+    Init-Drawing
+    $default = (New-Object System.Drawing.Printing.PrinterSettings).PrinterName
+    $cim = @{}
+    try { foreach ($p in (Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop)) { $cim["$($p.Name)"] = $p } } catch { Log "printers: no WMI details ($($_.Exception.Message))" }
+    $list = @()
+    foreach ($name in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) {
+        $state = 'ready'
+        $c = $cim["$name"]
+        if ($c) {
+            $err = [int]$c.DetectedErrorState
+            if ($c.WorkOffline -or [int]$c.PrinterStatus -eq 7 -or $err -eq 9) { $state = 'offline' }
+            elseif ($err -eq 4) { $state = 'nopaper' }
+            elseif ($err -eq 8) { $state = 'jam' }
+            elseif ($err -eq 7) { $state = 'door' }
+            elseif ([int]$c.PrinterStatus -eq 4) { $state = 'printing' }
+        }
+        $list += @{ name = "$name"; default = ("$name" -eq "$default"); state = $state }
+    }
+    Log "printers: $($list.Count) found, default '$default'"
+    return $list
+}
+
+function Find-Paper($ps, [int]$kind) {
+    foreach ($s in $ps.PaperSizes) { if ([int]$s.RawKind -eq $kind -and $s.Width -gt 0 -and $s.Height -gt 0) { return $s } }
+    return $null
+}
+
+function Open-Printer([string]$name) {
+    Init-Drawing
+    $ps = New-Object System.Drawing.Printing.PrinterSettings
+    $ps.PrinterName = $name
+    if (-not $ps.IsValid) { return $null }
+    return $ps
+}
+
+# Paper sizes (portrait, mm) and the edge the printer can't reach on one of them.
+function Get-PrinterInfo($req) {
+    $ps = Open-Printer "$($req.name)"
+    if (-not $ps) { return $null }
+    $sizes = @()
+    $seen = @{}
+    foreach ($s in $ps.PaperSizes) {
+        if ($s.Width -le 0 -or $s.Height -le 0) { continue }
+        $k = [int]$s.RawKind
+        if ($seen.ContainsKey($k)) { continue }
+        $seen[$k] = $true
+        $sizes += @{
+            kind = $k; name = "$($s.PaperName)"
+            w = [Math]::Round([Math]::Min($s.Width, $s.Height) * $HUNDREDTH_MM, 1)
+            h = [Math]::Round([Math]::Max($s.Width, $s.Height) * $HUNDREDTH_MM, 1)
+        }
+    }
+    $pick = $null
+    if ($req.paper) { $pick = Find-Paper $ps ([int]$req.paper) }
+    if (-not $pick) { $pick = $ps.DefaultPageSettings.PaperSize }
+    $hard = @{ t = 0; r = 0; b = 0; l = 0 }
+    $known = $false
+    try {
+        $pg = New-Object System.Drawing.Printing.PageSettings($ps)
+        $pg.PaperSize = $pick
+        $pg.Landscape = $false
+        $pa = $pg.PrintableArea
+        $W = [Math]::Min($pick.Width, $pick.Height); $H = [Math]::Max($pick.Width, $pick.Height)
+        if ($pa.Width -gt 0 -and $pa.Height -gt 0) {
+            $hard = @{
+                l = [Math]::Round([Math]::Max(0, $pa.X) * $HUNDREDTH_MM, 1)
+                t = [Math]::Round([Math]::Max(0, $pa.Y) * $HUNDREDTH_MM, 1)
+                r = [Math]::Round([Math]::Max(0, $W - $pa.Right) * $HUNDREDTH_MM, 1)
+                b = [Math]::Round([Math]::Max(0, $H - $pa.Bottom) * $HUNDREDTH_MM, 1)
+            }
+            $known = $true
+        }
+    } catch { Log "printer: couldn't read the printable area of '$($req.name)': $($_.Exception.Message)" }
+    $draft = $false
+    foreach ($r in $ps.PrinterResolutions) { if ($r.Kind -eq [System.Drawing.Printing.PrinterResolutionKind]::Draft) { $draft = $true } }
+    Log "printer: '$($req.name)' paper=$($pick.PaperName) hard t$($hard.t) r$($hard.r) b$($hard.b) l$($hard.l) colour=$($ps.SupportsColor) duplex=$($ps.CanDuplex)"
+    return @{
+        sizes = $sizes; paper = [int]$pick.RawKind; hard = $hard; hardKnown = $known
+        color = [bool]$ps.SupportsColor; duplex = [bool]$ps.CanDuplex; draft = $draft; maxCopies = [int]$ps.MaximumCopies
+    }
+}
+
+function Do-Print($job) {
+    $t0 = [Diagnostics.Stopwatch]::StartNew()
+    $ps = Open-Printer "$($job.printer)"
+    if (-not $ps) { return @{ ok = $false; code = 'printer'; error = "The printer '$($job.printer)' isn't available any more. Pick another one." } }
+    $size = Find-Paper $ps ([int]$job.paper)
+    if (-not $size) { return @{ ok = $false; code = 'paper'; error = "$($job.printer) doesn't offer that paper size any more. Pick another one." } }
+    $copies = [Math]::Max(1, [Math]::Min([int]$job.copies, [Math]::Max(1, [int]$ps.MaximumCopies)))
+    $ps.Copies = [int16]$copies
+    $ps.Collate = $true
+    # Prisca turns the stack by hand for "both sides", so the driver must not.
+    if ($ps.CanDuplex) { $ps.Duplex = [System.Drawing.Printing.Duplex]::Simplex }
+    # Tests print to a file (Microsoft Print to PDF) instead of paper.
+    if ($job.toFile) { $ps.PrintToFile = $true; $ps.PrintFileName = "$($job.toFile)" }
+
+    $doc = New-Object System.Drawing.Printing.PrintDocument
+    $doc.PrinterSettings = $ps
+    $doc.DocumentName = "$($job.title)"
+    $doc.OriginAtMargins = $false
+    # No "Printing page 1 of 3" window.
+    $doc.PrintController = New-Object System.Drawing.Printing.StandardPrintController
+    $dps = $doc.DefaultPageSettings
+    $dps.PaperSize = $size
+    $dps.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
+    $dps.Color = [bool]$job.color
+    if ($job.draft) {
+        foreach ($r in $ps.PrinterResolutions) { if ($r.Kind -eq [System.Drawing.Printing.PrinterResolutionKind]::Draft) { $dps.PrinterResolution = $r; break } }
+    }
+
+    $script:PJ = @{ sheets = @($job.sheets); i = 0 }
+    if ($script:PJ.sheets.Count -eq 0) { return @{ ok = $false; code = 'empty'; error = 'Nothing to print.' } }
+    $doc.add_QueryPageSettings({
+        param($sender, $e)
+        $e.PageSettings.Landscape = [bool]$script:PJ.sheets[$script:PJ.i].landscape
+    })
+    $doc.add_PrintPage({
+        param($sender, $e)
+        $sh = $script:PJ.sheets[$script:PJ.i]
+        $g = $e.Graphics
+        $g.PageUnit = [System.Drawing.GraphicsUnit]::Millimeter
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        # Drawing starts at the corner the printer can reach; positions are from the paper's corner.
+        $hx = [single]($e.PageSettings.HardMarginX * $HUNDREDTH_MM)
+        $hy = [single]($e.PageSettings.HardMarginY * $HUNDREDTH_MM)
+        foreach ($it in @($sh.items)) {
+            if (-not $it -or -not $it.path) { continue }
+            $img = [System.Drawing.Image]::FromFile("$($it.path)")
+            try {
+                $g.SetClip((New-Object System.Drawing.RectangleF(([single]$it.cx - $hx), ([single]$it.cy - $hy), ([single]$it.cw), ([single]$it.ch))))
+                $g.DrawImage($img, (New-Object System.Drawing.RectangleF(([single]$it.x - $hx), ([single]$it.y - $hy), ([single]$it.w), ([single]$it.h))))
+                $g.ResetClip()
+            } finally { $img.Dispose() }
+        }
+        $script:PJ.i++
+        $e.HasMorePages = $script:PJ.i -lt $script:PJ.sheets.Count
+    })
+    try { $doc.Print() } finally { $doc.Dispose() }
+    Log "print: '$($job.printer)' paper=$($size.PaperName) sheets=$($script:PJ.i) copies=$copies colour=$([bool]$job.color) draft=$([bool]$job.draft) in $($t0.ElapsedMilliseconds) ms"
+    return @{ ok = $true; sheets = $script:PJ.i; copies = $copies; paper = "$($size.PaperName)" }
+}
+
 Write-Reply @{ id = 0; ok = $true; ready = $true }
 
 while ($true) {
@@ -496,6 +652,13 @@ while ($true) {
             'probe'   { Write-Reply @{ id = $id; ok = $true; probe = (Do-Probe $req) } }
             'bench'   { $b = Do-Bench $req; Write-Reply @{ id = $id; ok = $true; results = $b.results; props = $b.props } }
             'ocr'     { $r = Do-Ocr "$($req.path)"; Write-Reply @{ id = $id; ok = $true; available = $r.available; language = $r.language; lines = $r.lines; max = $r.max } }
+            'printers' { Write-Reply @{ id = $id; ok = $true; printers = @(Get-Printers) } }
+            'printer' {
+                $r = Get-PrinterInfo $req
+                if ($r) { Write-Reply (@{ id = $id; ok = $true } + $r) }
+                else { Write-Reply @{ id = $id; ok = $false; code = 'printer'; error = "The printer '$($req.name)' isn't available any more." } }
+            }
+            'print'   { $r = Do-Print $req.job; $r.id = $id; Write-Reply $r }
             'ping'    { Write-Reply @{ id = $id; ok = $true } }
             default   { Write-Reply @{ id = $id; ok = $false; code = 'badcmd'; error = "Unknown command $($req.cmd)" } }
         }

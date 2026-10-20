@@ -37,6 +37,8 @@ jobs:
           node --check ui/imaging.js
           node --check ui/pdf.js
           node --check ui/backend.js
+          node --check ui/print.js
+          node scripts/test-print-layout.js
       # The scanner helper must at least load in Windows PowerShell 5.1 (no scanner on GitHub's machines).
       - name: Scanner helper starts and answers
         shell: powershell
@@ -45,6 +47,10 @@ jobs:
           $out
           if (-not ($out -match '"ready":true')) { throw "worker didn't start" }
           if (-not ($out -match '"id":1')) { throw "worker didn't answer" }
+      # A real print through the helper, to Microsoft Print to PDF (no paper).
+      - name: Printing works
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-print.ps1
       - name: Build the installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

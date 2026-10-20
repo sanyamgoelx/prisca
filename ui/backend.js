@@ -60,6 +60,11 @@ const Backend = (() => {
       return r ? (Array.isArray(r) ? r : [r]) : [];
     },
     reveal: (path) => T.opener.revealItemInDir(path).catch(() => {}),
+    // Printing: Windows' printers, a printer's paper sizes and unprintable edge, and print jobs.
+    printers: async () => toArray((await call('list_printers')).printers),
+    printerInfo: (name, paper) => call('printer_info', { name, paper: paper || 0 }),
+    stagePrint: (bytes) => call('stage_print', bytes),
+    print: (job) => call('print_job', { job }),
     // A newer published version, or null (also null when updates aren't set up).
     checkUpdate: async () => {
       try { return T.updater ? await T.updater.check() : null; } catch { return null; }
@@ -111,6 +116,26 @@ const Backend = (() => {
     pickFolder: async () => null,
     pickImages: async () => [],
     reveal: async () => {},
+    printers: async () => window.PRISCA_MOCK_PRINTERS || [
+      { name: 'HP Deskjet 1510 series', default: true, state: 'ready' },
+      { name: 'Microsoft Print to PDF', default: false, state: 'ready' },
+    ],
+    printerInfo: async (name, paper) => {
+      const sizes = [
+        { kind: 9, name: 'A4', w: 210, h: 297 }, { kind: 1, name: 'Letter', w: 215.9, h: 279.4 },
+        { kind: 5, name: 'Legal', w: 215.9, h: 355.6 }, { kind: 11, name: 'A5', w: 148, h: 210 },
+        { kind: 260, name: '4x6in', w: 101.6, h: 152.4 },
+      ];
+      const pick = sizes.find((s) => s.kind === paper) || sizes[0];
+      const hp = /HP/.test(name);
+      return { sizes, paper: pick.kind, hard: hp ? { t: 3, r: 3.2, b: 12.7, l: 3.2 } : { t: 0, r: 0, b: 0, l: 0 }, color: true, duplex: false, draft: true, maxCopies: 99 };
+    },
+    stagePrint: async (bytes) => { const path = `mock://print-${files.size}-${Date.now()}.jpg`; files.set(path, bytes); return path; },
+    print: async (job) => {
+      if (window.PRISCA_MOCK_PRINT_FAIL) throw { code: 'print', error: window.PRISCA_MOCK_PRINT_FAIL };
+      (window.PRISCA_PRINTED = window.PRISCA_PRINTED || []).push(job);
+      return { sheets: job.sheets.length, copies: job.copies };
+    },
     checkUpdate: async () => window.PRISCA_MOCK_UPDATE || null,
     relaunch: async () => { window.RELAUNCHED = true; },
     onFileDrop: () => {},

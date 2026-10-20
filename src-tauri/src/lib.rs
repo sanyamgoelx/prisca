@@ -10,6 +10,8 @@ struct AppState {
     scanner: Scanner,
     /// A second helper for text recognition, so reading a page never holds up the next scan.
     reader: Scanner,
+    /// A third helper for printing, so a print job never waits for a scan or the text reader.
+    printer: Scanner,
     scan_dir: PathBuf,
 }
 
@@ -62,6 +64,44 @@ async fn ocr_page(app: tauri::AppHandle, request: Request<'_>) -> Result<Value, 
         r
     })
     .await?;
+    check(reply)
+}
+
+/// Printers Windows knows about (name, default, state).
+#[tauri::command]
+async fn list_printers(app: tauri::AppHandle) -> Result<Value, String> {
+    let reply = blocking(app, |s| s.printer.request(json!({ "cmd": "printers" }), secs(60))).await?;
+    check(reply)
+}
+
+/// A printer's paper sizes, and the edge it can't print on for one paper size (0 = its default).
+#[tauri::command]
+async fn printer_info(app: tauri::AppHandle, name: String, paper: i64) -> Result<Value, String> {
+    let reply = blocking(app, move |s| {
+        s.printer.request(json!({ "cmd": "printer", "name": name, "paper": paper }), secs(60))
+    })
+    .await?;
+    check(reply)
+}
+
+/// Writes one page picture for a print job (body: JPEG) and returns its path.
+#[tauri::command]
+fn stage_print(state: State<'_, AppState>, request: Request<'_>) -> Result<String, String> {
+    let bytes: Vec<u8> = match request.body() {
+        InvokeBody::Raw(b) => b.clone(),
+        InvokeBody::Json(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+    };
+    let n = OCR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = state.scan_dir.join(format!("print-{n}.jpg"));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Couldn't prepare the page for printing: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Prints sheets laid out by the window: every picture at an exact place in mm.
+#[tauri::command]
+async fn print_job(app: tauri::AppHandle, job: Value) -> Result<Value, String> {
+    // Big jobs on a slow printer take a while to hand over to Windows.
+    let reply = blocking(app, move |s| s.printer.request(json!({ "cmd": "print", "job": job }), secs(900))).await?;
     check(reply)
 }
 
@@ -263,7 +303,12 @@ pub fn run() {
             // Leftovers from last time.
             let _ = std::fs::remove_dir_all(&scan_dir);
             let _ = std::fs::create_dir_all(&scan_dir);
-            app.manage(AppState { scanner: Scanner::new(cache.clone()), reader: Scanner::new(cache), scan_dir });
+            app.manage(AppState {
+                scanner: Scanner::new(cache.clone()),
+                reader: Scanner::new(cache.clone()),
+                printer: Scanner::new(cache),
+                scan_dir,
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -280,7 +325,11 @@ pub fn run() {
             save_file,
             default_folder,
             next_number,
-            path_exists
+            path_exists,
+            list_printers,
+            printer_info,
+            stage_print,
+            print_job
         ])
         .run(context)
         .expect("error while running Prisca");

@@ -35,6 +35,7 @@ function loadSettings() {
     layout: ['page', 'items', 'book'].includes(s.layout) ? s.layout : 'page',
     smartName: s.smartName !== false,
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
+    print: s.print && typeof s.print === 'object' ? s.print : {},
     presets,
   };
 }
@@ -914,7 +915,7 @@ async function scan({ replace = null, copy = false } = {}) {
   updateMeta();
   console.info(`[Prisca] scan ${scanMs} ms (scanner helper ${r.totalMs} ms, of which setup ${r.setupMs} ms, warm ${r.warm}); processing ${Math.round(performance.now() - t1)} ms`);
   if (blank) toast(`Skipped ${blank} blank page${blank === 1 ? '' : 's'}.`);
-  if (copy && added.length) { await printPages(added); return; }
+  if (copy && added.length) { await PrintPanel.quick(added); return; }
   if (!replace && source === 'flatbed' && autoRunning) afterAutoScan(added[0], added.length);
 }
 
@@ -988,8 +989,9 @@ async function importBytes(list) {
   for (const { bytes, name } of list) {
     try {
       const bitmap = await createImageBitmap(new Blob([bytes]));
-      if (settings.layout === 'page') await addBitmap(bitmap, 200, settings.preset, false);
-      else await addPieces(bitmap, 200, settings.preset, false, null, settings.layout);
+      // Pictures have no real size: printing at true size treats them as 200 dpi.
+      if (settings.layout === 'page') { const pg = await addBitmap(bitmap, 200, settings.preset, false); if (pg) pg.picture = true; }
+      else for (const pg of (await addPieces(bitmap, 200, settings.preset, false, null, settings.layout)) || []) pg.picture = true;
       added++;
     } catch {
       toast(`Couldn’t open ${name}. Use PNG, JPG, BMP, WebP or GIF.`, { bad: true });
@@ -1279,38 +1281,8 @@ async function save(startNew) {
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 
-// ---------- Printing ----------
-async function printPages(list) {
-  const pages = Array.isArray(list) ? list : state.pages;
-  if (!pages.length || state.saving || state.scanning) return;
-  if (state.cropping) finishCrop();
-  const area = $('printArea');
-  clearPrint();
-  toast('Preparing to print…', { sticky: true });
-  for (const p of pages) {
-    await nextFrame();
-    const c = Imaging.render(p, 2600);
-    const url = URL.createObjectURL(await Imaging.toBlob(c, 'image/jpeg', 0.9));
-    c.width = c.height = 0;
-    const div = document.createElement('div');
-    div.className = 'print-page';
-    const img = new Image();
-    img.src = url;
-    img.alt = '';
-    div.appendChild(img);
-    area.appendChild(div);
-    await img.decode().catch(() => {});
-  }
-  $('toast').hidden = true;
-  window.print();
-}
-function clearPrint() {
-  const area = $('printArea');
-  for (const img of area.querySelectorAll('img')) URL.revokeObjectURL(img.src);
-  area.innerHTML = '';
-}
-window.addEventListener('afterprint', () => setTimeout(clearPrint, 500));
-$('printBtn').onclick = () => printPages();
+// ---------- Printing (print.js) ----------
+$('printBtn').onclick = () => PrintPanel.open();
 $('saveBtn').onclick = () => save(false);
 $('saveNewBtn').onclick = () => save(true);
 
@@ -1332,11 +1304,13 @@ function toast(text, { bad = false, action = '', onAction = null, sticky = false
 // ---------- Keyboard ----------
 const isTyping = (el) => el && (el.tagName === 'INPUT' && el.type === 'text');
 window.addEventListener('keydown', (e) => {
+  if (PrintPanel.isOpen()) { PrintPanel.key(e); return; }
   const typing = isTyping(document.activeElement);
   const k = e.key;
   if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'p') {
     e.preventDefault();
-    printPages();
+    // Ctrl+Shift+P: print straight away with the last settings.
+    if (e.shiftKey) PrintPanel.quick(); else PrintPanel.open();
     return;
   }
   if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 's') {

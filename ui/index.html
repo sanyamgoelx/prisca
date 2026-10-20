@@ -192,7 +192,7 @@
         <button class="save-btn" id="saveBtn"><span id="saveLabel">Save</span><kbd class="key dark">Ctrl S</kbd></button>
         <div class="btn-row">
           <button class="ghost grow" id="saveNewBtn">Save and start new batch</button>
-          <button class="ghost" id="printBtn" title="Print the batch (Ctrl+P)">
+          <button class="ghost" id="printBtn" title="Print the batch: margins, size and anchor (Ctrl+P). Ctrl+Shift+P prints straight away with the last settings.">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 9V3h12v6"></path><rect x="3" y="9" width="18" height="8" rx="2"></rect><path d="M6 14h12v7H6z"></path></svg>
             Print
           </button>
@@ -201,11 +201,121 @@
     </aside>
   </main>
 
+  <section class="print-panel" id="printPanel" hidden aria-label="Print">
+    <div class="pr-preview">
+      <div class="pr-legend">
+        <span><i class="lg-margin"></i>Your margins</span>
+        <span><i class="lg-hard"></i>Printer can’t reach</span>
+        <span><i class="lg-anchor"></i>Anchor</span>
+        <span class="spacer"></span>
+        <span class="mono" id="prPaperLine"></span>
+      </div>
+      <div class="pr-stage" id="prStage"><div class="pr-sheet" id="prSheet"></div></div>
+      <div class="pr-foot">
+        <div class="pr-sheets" id="prSheets"></div>
+        <div class="spacer"></div>
+        <div class="pr-warns" id="prWarn" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <aside class="pr-side">
+      <div class="pr-head">
+        <span class="pr-title">Print</span>
+        <button class="ghost" id="prClose">Back to scans <kbd>Esc</kbd></button>
+      </div>
+      <div class="pr-scroll">
+        <section class="pr-group">
+          <label class="pr-label" for="prPrinter">Printer</label>
+          <select id="prPrinter" class="pr-select"></select>
+          <div class="pr-chips" id="prProfiles"></div>
+          <button class="pr-add" id="prSaveProfile" title="Save the paper, margins, size, anchor and pages per sheet under a name">+ Save as…</button>
+          <form class="pr-name" id="prProfileForm" hidden>
+            <input type="text" id="prProfileName" maxlength="40" placeholder="Name, e.g. Bills on A4" aria-label="Name for this setup">
+            <button type="submit" class="ghost">Save</button>
+            <button type="button" class="ghost" id="prProfileCancel">Cancel</button>
+          </form>
+          <p class="pr-note" id="prPrinterState"></p>
+        </section>
+
+        <section class="pr-group">
+          <label class="pr-field">Paper<select id="prPaper" class="pr-select"></select></label>
+          <div class="pr-field">Orientation
+            <div class="seg" id="prOrient"><button data-v="auto" title="Each sheet turns to suit its page">Auto</button><button data-v="port">Portrait</button><button data-v="land">Landscape</button></div>
+          </div>
+        </section>
+
+        <section class="pr-group">
+          <div class="pr-row"><span class="pr-label">Margins · mm</span>
+            <div class="pr-presets" id="prMPresets"><button data-v="0">0</button><button data-v="5">5</button><button data-v="10">10</button><button data-v="20">20</button></div>
+          </div>
+          <div class="pr-margins">
+            <label class="m-t">Top<input type="number" id="prMT" min="0" max="200" step="0.5"></label>
+            <label class="m-l">Left<input type="number" id="prML" min="0" max="200" step="0.5"></label>
+            <button class="m-link" id="prLink" title="Change all four margins together"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"></path><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"></path></svg><span id="prLinkLabel">linked</span></button>
+            <label class="m-r">Right<input type="number" id="prMR" min="0" max="200" step="0.5"></label>
+            <label class="m-b">Bottom<input type="number" id="prMB" min="0" max="200" step="0.5"></label>
+          </div>
+        </section>
+
+        <section class="pr-group">
+          <span class="pr-label">Size on paper</span>
+          <div class="seg" id="prMode"><button data-v="fit" title="As big as fits inside the margins">Fit</button><button data-v="fill" title="Covers the space inside the margins; edges may be trimmed">Fill</button><button data-v="actual" title="Same physical size as the original">True size</button><button data-v="custom">Custom</button></div>
+          <div class="pr-pct" id="prPctRow" hidden>
+            <input type="range" id="prPctRange" min="10" max="200" aria-label="Size in percent of true size">
+            <input type="number" id="prPct" min="10" max="400" aria-label="Size in percent of true size"><span>% of true size</span>
+          </div>
+          <div class="pr-anchor-row">
+            <div>
+              <span class="pr-small">Anchor</span>
+              <div class="pr-anchor" id="prAnchor">
+                <button aria-label="Anchor top left"><i></i></button><button aria-label="Anchor top centre"><i></i></button><button aria-label="Anchor top right"><i></i></button>
+                <button aria-label="Anchor middle left"><i></i></button><button aria-label="Anchor centre"><i></i></button><button aria-label="Anchor middle right"><i></i></button>
+                <button aria-label="Anchor bottom left"><i></i></button><button aria-label="Anchor bottom centre"><i></i></button><button aria-label="Anchor bottom right"><i></i></button>
+              </div>
+            </div>
+            <div class="pr-anchor-text">
+              <span class="pr-small" id="prAnchorName"></span>
+              <p class="pr-note">Scaling grows and shrinks from this point; spare space goes to the other sides.</p>
+              <div class="pr-nudge">
+                <label>Nudge X<input type="number" id="prOffX" step="0.5" min="-50" max="50"></label>
+                <label>Y<input type="number" id="prOffY" step="0.5" min="-50" max="50"></label>
+                <span>mm</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="pr-group pr-two">
+          <div class="pr-field">Pages per sheet<div class="seg" id="prNup"><button data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button></div></div>
+          <div class="pr-field">Ink<div class="seg" id="prInk"><button data-v="colour">Colour</button><button data-v="grey">Grey</button><button data-v="draft" title="Grey and lighter, to save ink">Draft</button></div></div>
+          <label class="pr-field">Copies<input type="number" id="prCopies" min="1" max="99" class="pr-input"></label>
+          <label class="pr-field">Pages<input type="text" id="prPages" class="pr-input" placeholder="All, or 1-3, 5"></label>
+        </section>
+
+        <section class="pr-group">
+          <div class="pr-toggle-row">
+            <div><span class="pr-strong">Both sides</span><p class="pr-note" id="prDuplexNote"></p></div>
+            <button class="switch" id="prDuplex" role="switch" aria-checked="false" aria-label="Print on both sides"><span></span></button>
+          </div>
+          <label class="pr-check" id="prReverseRow"><input type="checkbox" id="prReverse"><span>Print the backs in reverse order<small class="pr-note">Turn off if the backs come out in the wrong order.</small></span></label>
+        </section>
+      </div>
+
+      <div class="pr-step" id="prStep" hidden>
+        <p id="prStepText"></p>
+        <div class="btn-row"><button class="pr-go" id="prBacks">Print the backs</button><button class="ghost" id="prStepCancel">Skip</button></div>
+      </div>
+      <div class="pr-actions">
+        <button class="pr-go" id="prGo"><span id="prGoLabel">Print</span><kbd class="key dark">Ctrl P</kbd></button>
+        <span class="pr-sub" id="prSub"></span>
+      </div>
+    </aside>
+  </section>
+
   <div class="toast" id="toast" hidden role="status" aria-live="polite">
     <span id="toastText"></span>
     <button id="toastAction" hidden></button>
   </div>
-  <div class="print-area" id="printArea"></div>
   <div class="drop-veil" id="dropVeil" hidden>Drop pictures to add them to the batch</div>
 </div>
 
@@ -213,5 +323,6 @@
 <script src="imaging.js"></script>
 <script src="pdf.js"></script>
 <script src="app.js"></script>
+<script src="print.js"></script>
 </body>
 </html>
