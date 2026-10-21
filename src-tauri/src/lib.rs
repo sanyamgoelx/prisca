@@ -4,7 +4,8 @@ use scanner::Scanner;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tauri::ipc::{InvokeBody, Request, Response};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+use std::sync::Mutex;
 
 struct AppState {
     scanner: Scanner,
@@ -13,6 +14,130 @@ struct AppState {
     /// A third helper for printing, so a print job never waits for a scan or the text reader.
     printer: Scanner,
     scan_dir: PathBuf,
+    /// Files and switches Prisca was started with (right-click menu, Prisca printer), until the window takes them.
+    startup_args: Mutex<Vec<String>>,
+}
+
+/// Command-line words that mean something to the window: --print/--add <file>, --inbox.
+fn useful_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter().skip(1).filter(|a| !a.is_empty()).collect()
+}
+
+/// What Prisca was started with (taken once).
+#[tauri::command]
+fn take_startup_args(state: State<'_, AppState>) -> Vec<String> {
+    state.startup_args.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+/// Renders a PDF's pages to pictures (Windows' own PDF renderer) for the batch.
+#[tauri::command]
+async fn pdf_pages(app: tauri::AppHandle, path: String, dpi: u32, max: u32) -> Result<Value, String> {
+    let reply = blocking(app, move |s| {
+        let out = s.scan_dir.to_string_lossy().to_string();
+        s.printer.request(json!({ "cmd": "pdf", "path": path, "dpi": dpi, "max": max, "out": out }), secs(600))
+    })
+    .await?;
+    check(reply)
+}
+
+/// Where the Prisca printer drops what other apps print.
+fn inbox_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join("Prisca").join("inbox")
+}
+
+/// Moves finished print jobs out of the Prisca printer's folder into the scan folder.
+/// A job Windows is still writing can't be moved yet and is left for the next look.
+#[tauri::command]
+fn inbox_take(state: State<'_, AppState>) -> Value {
+    let dir = inbox_dir();
+    let mut taken = Vec::new();
+    let mut waiting = 0;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let is_pdf = p.extension().map_or(false, |x| x.eq_ignore_ascii_case("pdf"));
+            let meta = e.metadata().ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            if !is_pdf || len == 0 {
+                continue;
+            }
+            // Still being written (or only just finished): look again shortly.
+            let fresh = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map_or(false, |d| d < std::time::Duration::from_millis(1500));
+            if fresh {
+                waiting += 1;
+                continue;
+            }
+            let n = OCR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dest = state.scan_dir.join(format!("printed-{n}.pdf"));
+            let moved = std::fs::rename(&p, &dest).is_ok()
+                || (std::fs::copy(&p, &dest).is_ok() && std::fs::remove_file(&p).map_err(|_| { let _ = std::fs::remove_file(&dest); }).is_ok());
+            if moved { taken.push(dest.to_string_lossy().to_string()); } else { waiting += 1; }
+        }
+    }
+    json!({ "files": taken, "waiting": waiting, "folder": dir.to_string_lossy() })
+}
+
+/// Is the Prisca printer set up (printer, its folder, the task that opens Prisca)?
+#[tauri::command]
+async fn printer_setup_state(app: tauri::AppHandle) -> Result<Value, String> {
+    let inbox = inbox_dir().to_string_lossy().to_string();
+    let reply = blocking(app, move |s| {
+        s.printer.request(json!({ "cmd": "prisca-printer", "mode": "state", "inbox": inbox }), secs(60))
+    })
+    .await?;
+    check(reply)
+}
+
+/// Adds or removes the Prisca printer. Windows asks for permission once (administrator).
+#[tauri::command]
+async fn printer_setup(app: tauri::AppHandle, mode: String) -> Result<Value, String> {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let inbox = inbox_dir().to_string_lossy().to_string();
+    let reply = blocking(app, move |s| {
+        s.printer.request(json!({ "cmd": "prisca-printer", "mode": mode, "exe": exe, "inbox": inbox }), secs(300))
+    })
+    .await?;
+    check(reply)
+}
+
+#[cfg(windows)]
+const MENU_EXTS: [&str; 10] = [".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff", ".jfif"];
+
+/// "Print with Prisca" and "Open in Prisca" on PDFs and pictures (this user only, no admin).
+#[tauri::command]
+fn context_menu(on: bool) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+        for ext in MENU_EXTS {
+            let base = format!("Software\\Classes\\SystemFileAssociations\\{ext}\\shell");
+            for (verb, label, flag) in [("Prisca.Print", "Print with Prisca", "--print"), ("Prisca.Open", "Open in Prisca", "--add")] {
+                let key = format!("{base}\\{verb}");
+                if on {
+                    let (k, _) = hkcu.create_subkey(&key).map_err(|e| e.to_string())?;
+                    k.set_value("", &label).map_err(|e| e.to_string())?;
+                    k.set_value("Icon", &format!("\"{exe}\",0")).map_err(|e| e.to_string())?;
+                    let (c, _) = hkcu.create_subkey(format!("{key}\\command")).map_err(|e| e.to_string())?;
+                    c.set_value("", &format!("\"{exe}\" {flag} \"%1\"")).map_err(|e| e.to_string())?;
+                } else {
+                    let _ = hkcu.delete_subkey_all(&key);
+                }
+            }
+        }
+        Ok(on)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = on;
+        Err("The right-click menu is a Windows feature.".into())
+    }
 }
 
 /// Scanners Windows knows about.
@@ -270,8 +395,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// Run by the uninstaller: right-click menu out, the Prisca printer and its task removed.
+fn uninstall_cleanup() {
+    let _ = context_menu(false);
+    let helper = Scanner::new(std::env::temp_dir().join("Prisca"));
+    let inbox = inbox_dir().to_string_lossy().to_string();
+    let _ = helper.request(json!({ "cmd": "prisca-printer", "mode": "remove", "inbox": inbox, "exe": "" }), secs(300));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().any(|a| a == "--uninstall") {
+        uninstall_cleanup();
+        return;
+    }
     let context = tauri::generate_context!();
     // Updates are switched on once release-setup has put the signing key's
     // public half in tauri.conf.json (plugins.updater).
@@ -283,7 +420,16 @@ pub fn run() {
         .and_then(|u| u.get("pubkey"))
         .and_then(|k| k.as_str())
         .map_or(false, |k| !k.is_empty());
-    let mut builder = tauri::Builder::default();
+    // One Prisca: a second start (right-click menu, the Prisca printer) hands its files to the open window.
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        let args = useful_args(argv);
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        let _ = app.emit("prisca://args", args);
+    }));
     if updater {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
@@ -308,6 +454,7 @@ pub fn run() {
                 reader: Scanner::new(cache.clone()),
                 printer: Scanner::new(cache),
                 scan_dir,
+                startup_args: Mutex::new(useful_args(std::env::args())),
             });
             Ok(())
         })
@@ -329,7 +476,13 @@ pub fn run() {
             list_printers,
             printer_info,
             stage_print,
-            print_job
+            print_job,
+            take_startup_args,
+            pdf_pages,
+            inbox_take,
+            printer_setup_state,
+            printer_setup,
+            context_menu
         ])
         .run(context)
         .expect("error while running Prisca");

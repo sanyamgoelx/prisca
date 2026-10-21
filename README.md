@@ -14,7 +14,9 @@ Fast scanning for any scanner or all-in-one printer on Windows (Pri + Sca: Print
 - File names come from the first page when it has a clear title, e.g. `Invoice 1043 2026-10-09`.
 - Black-and-white pages are saved as true black and white: PDFs about a tenth of the size.
 - **Report a problem** (scanner menu, or on a scan error) opens a pre-filled GitHub issue and saves a scanner report to attach.
-- Drop pictures (or **Add pictures**) to clean up photos of documents the same way.
+- Drop pictures (or **Add pictures or PDFs**) to clean up photos of documents the same way. **PDFs** open as pages at their real size (Windows' own PDF renderer), untouched, ready to print with Prisca's margins and anchor.
+- **Prisca as a printer** (scanner menu › *Add Prisca as a printer…*, Windows asks for permission once): pick *Prisca* in any app's print dialog (Chrome / Google Drive: *Destination › See more*) and the document opens in Prisca's print panel. Prisca opens by itself when a job arrives.
+- **Right-click menu**: *Print with Prisca* and *Open in Prisca* on PDFs and pictures (Windows 11: under *Show more options*). Can be turned off in the scanner menu.
 - Updates install themselves.
 
 ## Download

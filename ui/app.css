@@ -57,6 +57,7 @@ kbd { font-family: var(--mono); font-size: 12px; background: var(--raised); bord
 .menu button { display: flex; width: 100%; text-align: left; gap: 10px; align-items: center; background: transparent; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer; color: var(--text-2); }
 .menu button:hover { background: var(--line); }
 .menu button[aria-selected="true"] { color: var(--accent-text); }
+.menu .menu-sep { height: 1px; background: var(--line-2); margin: 6px 4px; }
 .menu .menu-note { padding: 8px 10px; color: var(--faint); font-size: 12px; line-height: 1.45; }
 
 /* Body */

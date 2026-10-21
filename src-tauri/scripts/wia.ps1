@@ -635,6 +635,174 @@ function Do-Print($job) {
     return @{ ok = $true; sheets = $script:PJ.i; copies = $copies; paper = "$($size.PaperName)" }
 }
 
+# ---------- PDFs ----------
+# Windows' own PDF renderer (Windows.Data.Pdf) turns each page into a PNG for the batch.
+$script:PdfReady = $false
+function Init-Pdf {
+    if ($script:PdfReady) { return }
+    Init-Ocr
+    [void][Windows.Data.Pdf.PdfDocument,Windows.Data.Pdf,ContentType=WindowsRuntime]
+    [void][Windows.Data.Pdf.PdfPageRenderOptions,Windows.Data.Pdf,ContentType=WindowsRuntime]
+    [void][Windows.Storage.Streams.InMemoryRandomAccessStream,Windows.Storage.Streams,ContentType=WindowsRuntime]
+    $script:AsTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction'
+    })[0]
+    $script:PdfReady = $true
+}
+function Await-Action($op) {
+    $task = $script:AsTaskAction.Invoke($null, @($op))
+    [void]$task.Wait(-1)
+}
+
+function Do-Pdf($req) {
+    Init-Pdf
+    $path = "$($req.path)"
+    if (-not (Test-Path -LiteralPath $path)) { return @{ ok = $false; code = 'missing'; error = "Couldn't find $path." } }
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
+    try {
+        $doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+    } catch {
+        $m = "$($_.Exception.Message) $($_.Exception.InnerException)"
+        if ($m -match 'password') { return @{ ok = $false; code = 'locked'; error = 'This PDF is password-protected. Open it, print it to the Prisca printer, or save an unlocked copy.' } }
+        return @{ ok = $false; code = 'pdf'; error = "Windows couldn't read this PDF: $($_.Exception.Message)" }
+    }
+    $count = [int]$doc.PageCount
+    $max = if ($req.max) { [int]$req.max } else { 150 }
+    $dpi = if ($req.dpi) { [int]$req.dpi } else { 200 }
+    # Long documents at a lower resolution, so the batch doesn't run out of memory.
+    if ($count -gt 30) { $dpi = [Math]::Min($dpi, 150) }
+    $stem = [IO.Path]::GetFileNameWithoutExtension($path) -replace '[^\w\-]', '_'
+    $pages = @()
+    $n = [Math]::Min($count, $max)
+    for ($i = 0; $i -lt $n; $i++) {
+        $page = $doc.GetPage([uint32]$i)
+        try {
+            # Size is in 1/96 inch, already turned by the page's rotation.
+            $wIn = $page.Size.Width / 96.0; $hIn = $page.Size.Height / 96.0
+            $opt = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+            $opt.DestinationWidth = [uint32][Math]::Max(1, [Math]::Round($wIn * $dpi))
+            $opt.DestinationHeight = [uint32][Math]::Max(1, [Math]::Round($hIn * $dpi))
+            $opt.BitmapEncoderId = [Windows.Graphics.Imaging.BitmapEncoder]::PngEncoderId
+            $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+            try {
+                Await-Action ($page.RenderToStreamAsync($stream, $opt))
+                $out = Join-Path "$($req.out)" ("pdf-{0}-{1}-{2:D3}.png" -f $stem, [Environment]::TickCount, ($i + 1))
+                $src = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream.GetInputStreamAt(0))
+                $fs = [System.IO.File]::Create($out)
+                try { $src.CopyTo($fs) } finally { $fs.Dispose(); $src.Dispose() }
+            } finally { $stream.Dispose() }
+            $pages += @{ path = $out; wIn = [Math]::Round($wIn, 4); hIn = [Math]::Round($hIn, 4); dpi = $dpi }
+        } finally { $page.Dispose() }
+    }
+    Log "pdf: $count pages, rendered $n at $dpi dpi from '$path'"
+    return @{ ok = $true; pages = $pages; count = $count; rendered = $n; dpi = $dpi }
+}
+
+# ---------- The Prisca printer ----------
+# A Windows printer named "Prisca" (Microsoft Print to PDF's driver on a file port) saves whatever an
+# app prints into C:\ProgramData\Prisca\inbox; a task for this user starts Prisca when a job finishes.
+# Adding/removing the printer needs administrator rights once (Windows asks); the task doesn't.
+$PRISCA_TASK = 'Prisca print inbox'
+$PrinterAdmin = @'
+param([string]$Mode, [string]$Inbox, [string]$Out)
+$ErrorActionPreference = 'Stop'
+$r = @{ ok = $false }
+try {
+    $port = Join-Path $Inbox 'job.pdf'
+    if ($Mode -eq 'add') {
+        New-Item -ItemType Directory -Force -Path $Inbox | Out-Null
+        # The print spooler writes the file; Prisca (this user) moves it away.
+        & icacls.exe $Inbox /grant '*S-1-1-0:(OI)(CI)M' /Q | Out-Null
+        $drv = Get-PrinterDriver | Where-Object { $_.Name -eq 'Microsoft Print To PDF' } | Select-Object -First 1
+        if (-not $drv) { throw 'Microsoft Print to PDF is turned off in Windows. Turn it on in Settings > Optional features (or Windows Features), then try again.' }
+        if (-not (Get-PrinterPort -Name $port -ErrorAction SilentlyContinue)) {
+            try { Add-PrinterPort -Name $port }
+            catch {
+                New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Ports' -Name $port -Value '' -PropertyType String -Force | Out-Null
+                Restart-Service -Name Spooler -Force
+                Start-Sleep -Seconds 2
+            }
+        }
+        if (Get-Printer -Name 'Prisca' -ErrorAction SilentlyContinue) { Set-Printer -Name 'Prisca' -DriverName $drv.Name -PortName $port }
+        else { Add-Printer -Name 'Prisca' -DriverName $drv.Name -PortName $port -Comment 'Sends what you print to the Prisca app' }
+        # The task that opens Prisca listens for "document printed" in this log (off by default).
+        & wevtutil.exe sl Microsoft-Windows-PrintService/Operational /e:true | Out-Null
+    } else {
+        if (Get-Printer -Name 'Prisca' -ErrorAction SilentlyContinue) { Remove-Printer -Name 'Prisca' }
+        Start-Sleep -Milliseconds 500
+        if (Get-PrinterPort -Name $port -ErrorAction SilentlyContinue) { try { Remove-PrinterPort -Name $port } catch {} }
+    }
+    $r.ok = $true
+} catch { $r.error = $_.Exception.Message }
+$r | ConvertTo-Json -Compress | Set-Content -LiteralPath $Out -Encoding UTF8
+'@
+
+function Get-PriscaPrinterState([string]$inbox) {
+    $p = Get-Printer -Name 'Prisca' -ErrorAction SilentlyContinue
+    $t = Get-ScheduledTask -TaskName $PRISCA_TASK -ErrorAction SilentlyContinue
+    return @{
+        printer = [bool]$p
+        port = if ($p) { "$($p.PortName)" } else { '' }
+        driver = if ($p) { "$($p.DriverName)" } else { '' }
+        task = [bool]$t
+        taskExe = if ($t) { "$($t.Actions[0].Execute)" } else { '' }
+    }
+}
+
+function Register-PriscaTask([string]$exe) {
+    $esc = [Security.SecurityElement]::Escape($exe)
+    $query = [Security.SecurityElement]::Escape("<QueryList><Query Id=""0"" Path=""Microsoft-Windows-PrintService/Operational""><Select Path=""Microsoft-Windows-PrintService/Operational"">*[System[(EventID=307)]] and *[UserData[DocumentPrinted[Param5='Prisca']]]</Select></Query></QueryList>")
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Opens Prisca when something is printed to the Prisca printer.</Description></RegistrationInfo>
+  <Triggers><EventTrigger><Enabled>true</Enabled><Subscription>$query</Subscription></EventTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>$esc</Command><Arguments>--inbox</Arguments></Exec></Actions>
+</Task>
+"@
+    Register-ScheduledTask -TaskName $PRISCA_TASK -Xml $xml -Force | Out-Null
+}
+
+function Do-PriscaPrinter($req) {
+    $inbox = "$($req.inbox)"
+    if ($req.mode -eq 'state') { return (@{ ok = $true } + (Get-PriscaPrinterState $inbox)) }
+    $mode = if ($req.mode -eq 'remove') { 'remove' } else { 'add' }
+    $state = Get-PriscaPrinterState $inbox
+    $wantPort = Join-Path $inbox 'job.pdf'
+    # The admin part only when the printer itself has to change.
+    $needAdmin = if ($mode -eq 'add') { -not $state.printer -or $state.port -ne $wantPort } else { $state.printer }
+    if ($needAdmin) {
+        $dir = Join-Path $env:TEMP 'prisca-setup'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script = Join-Path $dir 'printer-admin.ps1'
+        $okFile = Join-Path $dir ("result-{0}.json" -f [Environment]::TickCount)
+        [IO.File]::WriteAllText($script, $PrinterAdmin, (New-Object System.Text.UTF8Encoding $true))
+        $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -Mode $mode -Inbox `"$inbox`" -Out `"$okFile`""
+        try { Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden -Wait }
+        catch { return @{ ok = $false; code = 'declined'; error = 'Windows asked for permission and it wasn''t given, so nothing changed.' } }
+        if (-not (Test-Path -LiteralPath $okFile)) { return @{ ok = $false; code = 'setup'; error = 'The setup didn''t finish. Nothing was changed.' } }
+        $res = Get-Content -LiteralPath $okFile -Raw | ConvertFrom-Json
+        Remove-Item -LiteralPath $okFile -ErrorAction SilentlyContinue
+        if (-not $res.ok) { return @{ ok = $false; code = 'setup'; error = "Couldn't $mode the Prisca printer: $($res.error)" } }
+    }
+    $taskError = ''
+    try {
+        if ($mode -eq 'add') { Register-PriscaTask "$($req.exe)" }
+        elseif ($state.task) { Unregister-ScheduledTask -TaskName $PRISCA_TASK -Confirm:$false }
+    } catch { $taskError = $_.Exception.Message; Log "prisca printer: task $mode failed: $taskError" }
+    Log "prisca printer: $mode done (admin step: $needAdmin)"
+    return (@{ ok = $true; taskError = $taskError } + (Get-PriscaPrinterState $inbox))
+}
+
 Write-Reply @{ id = 0; ok = $true; ready = $true }
 
 while ($true) {
@@ -659,6 +827,8 @@ while ($true) {
                 else { Write-Reply @{ id = $id; ok = $false; code = 'printer'; error = "The printer '$($req.name)' isn't available any more." } }
             }
             'print'   { $r = Do-Print $req.job; $r.id = $id; Write-Reply $r }
+            'pdf'     { $r = Do-Pdf $req; $r.id = $id; Write-Reply $r }
+            'prisca-printer' { $r = Do-PriscaPrinter $req; $r.id = $id; Write-Reply $r }
             'ping'    { Write-Reply @{ id = $id; ok = $true } }
             default   { Write-Reply @{ id = $id; ok = $false; code = 'badcmd'; error = "Unknown command $($req.cmd)" } }
         }

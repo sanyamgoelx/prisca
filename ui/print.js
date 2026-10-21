@@ -178,6 +178,8 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   // ---------- Printers ----------
   async function loadPrinters() {
     try { P.printers = await Backend.printers(); } catch (e) { P.printers = []; toast(e.error || 'Couldn’t list the printers.', { bad: true }); }
+    // Prisca's own printer only hands jobs back to Prisca: never print to it from here.
+    P.printers = P.printers.filter((p) => p.name !== 'Prisca');
     return P.printers;
   }
   function pickPrinter() {
@@ -582,7 +584,14 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       }
       discardAll(paths);
       const copiesNote = pass.copies > 1 ? ` × ${pass.copies} copies` : '';
-      toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`);
+      const job = P.job && P.job.filter((pg) => state.pages.includes(pg));
+      if (job && job.length && closeAfter) {
+        // Pages that only came in to be printed: offer to take them out of the batch again.
+        toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`, {
+          action: `Remove ${job.length === 1 ? 'that page' : `those ${job.length} pages`} from the batch`, duration: 10000,
+          onAction: () => { for (const pg of job) { const i = state.pages.indexOf(pg); if (i >= 0) removePage(i, { undoable: false }); } },
+        });
+      } else toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`);
       if (closeAfter) close();
       return true;
     } catch (e) {
@@ -618,8 +627,11 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
 
   // ---------- Open / close / quick print ----------
-  async function open() {
+  // opts.pages: preselect those pages ("4-6"); opts.job: the pages that came in just to be printed.
+  async function open(opts = {}) {
     if (P.open) return;
+    P.job = opts.job || null;
+    if (opts.pages) P.pagesText = opts.pages;
     if (!state.pages.length) { toast('Scan or add a page first.'); return; }
     if (state.scanning || state.saving) return;
     if (state.cropping) finishCrop();
@@ -635,6 +647,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     if (!P.open) return;
     if (P.step) cancelStep();
     P.open = false;
+    if (P.job) { P.job = null; P.pagesText = 'All'; }
     el('printPanel').hidden = true;
     document.body.classList.remove('printing');
   }

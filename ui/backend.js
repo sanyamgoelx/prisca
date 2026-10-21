@@ -54,8 +54,8 @@ const Backend = (() => {
     pickImages: async () => {
       const r = await T.dialog.open({
         multiple: true,
-        title: 'Add pictures',
-        filters: [{ name: 'Pictures', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'webp', 'gif', 'tif', 'tiff'] }],
+        title: 'Add pictures or PDFs',
+        filters: [{ name: 'Pictures and PDFs', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'jfif', 'bmp', 'webp', 'gif', 'tif', 'tiff'] }],
       });
       return r ? (Array.isArray(r) ? r : [r]) : [];
     },
@@ -65,6 +65,14 @@ const Backend = (() => {
     printerInfo: (name, paper) => call('printer_info', { name, paper: paper || 0 }),
     stagePrint: (bytes) => call('stage_print', bytes),
     print: (job) => call('print_job', { job }),
+    // PDFs, files Prisca was opened with (right-click menu), and the Prisca printer.
+    pdfPages: async (path, dpi, max) => { const r = await call('pdf_pages', { path, dpi, max }); return { ...r, pages: toArray(r.pages) }; },
+    startupArgs: () => call('take_startup_args').catch(() => []),
+    onArgs: (fn) => { T.event.listen('prisca://args', (e) => fn(e.payload || [])); },
+    inboxTake: () => call('inbox_take').catch(() => ({ files: [], waiting: 0 })),
+    printerSetupState: () => call('printer_setup_state'),
+    printerSetup: (mode) => call('printer_setup', { mode }),
+    contextMenu: (on) => call('context_menu', { on }),
     // A newer published version, or null (also null when updates aren't set up).
     checkUpdate: async () => {
       try { return T.updater ? await T.updater.check() : null; } catch { return null; }
@@ -131,6 +139,27 @@ const Backend = (() => {
       return { sizes, paper: pick.kind, hard: hp ? { t: 3, r: 3.2, b: 12.7, l: 3.2 } : { t: 0, r: 0, b: 0, l: 0 }, color: true, duplex: false, draft: true, maxCopies: 99 };
     },
     stagePrint: async (bytes) => { const path = `mock://print-${files.size}-${Date.now()}.jpg`; files.set(path, bytes); return path; },
+    pdfPages: async (path, dpi, max) => {
+      if (window.PRISCA_MOCK_PDF_FAIL) throw { code: 'pdf', error: window.PRISCA_MOCK_PDF_FAIL };
+      const n = window.PRISCA_MOCK_PDF_PAGES || 2, pages = [];
+      for (let i = 0; i < Math.min(n, max || 150); i++) {
+        const c = document.createElement('canvas');
+        c.width = Math.round(8.27 * dpi); c.height = Math.round(11.69 * dpi);
+        const g = c.getContext('2d');
+        g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+        g.fillStyle = '#1a3a6b'; g.font = `${dpi / 3}px sans-serif`; g.fillText(`PDF page ${i + 1}`, dpi, dpi * 1.5);
+        const p = `mock://pdf-${i}-${Date.now()}.png`;
+        files.set(p, new Uint8Array(await (await new Promise((r) => c.toBlob(r, 'image/png'))).arrayBuffer()));
+        pages.push({ path: p, wIn: 8.27, hIn: 11.69, dpi });
+      }
+      return { pages, count: n, rendered: pages.length, dpi };
+    },
+    startupArgs: async () => window.PRISCA_MOCK_ARGS || [],
+    onArgs: (fn) => { window.PRISCA_SEND_ARGS = fn; },
+    inboxTake: async () => { const f = window.PRISCA_MOCK_INBOX || []; window.PRISCA_MOCK_INBOX = []; return { files: f, waiting: 0 }; },
+    printerSetupState: async () => window.PRISCA_MOCK_PRINTER_STATE || { printer: false, task: false },
+    printerSetup: async (mode) => { window.PRISCA_MOCK_PRINTER_STATE = { printer: mode !== 'remove', task: mode !== 'remove', taskError: '' }; return window.PRISCA_MOCK_PRINTER_STATE; },
+    contextMenu: async (on) => { window.PRISCA_MOCK_MENU = on; return on; },
     print: async (job) => {
       if (window.PRISCA_MOCK_PRINT_FAIL) throw { code: 'print', error: window.PRISCA_MOCK_PRINT_FAIL };
       (window.PRISCA_PRINTED = window.PRISCA_PRINTED || []).push(job);

@@ -36,6 +36,7 @@ function loadSettings() {
     smartName: s.smartName !== false,
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     print: s.print && typeof s.print === 'object' ? s.print : {},
+    contextMenu: s.contextMenu !== false,
     presets,
   };
 }
@@ -224,6 +225,23 @@ function openDeviceMenu() {
     rep.onclick = () => { m.hidden = true; saveScannerReport(); };
     m.appendChild(rep);
   }
+  const sep = document.createElement('div');
+  sep.className = 'menu-sep';
+  m.appendChild(sep);
+  const pr = document.createElement('button');
+  pr.textContent = priscaPrinter.printer ? 'Remove the Prisca printer…' : 'Add Prisca as a printer…';
+  pr.title = priscaPrinter.printer
+    ? 'Other apps will no longer list Prisca as a printer'
+    : 'So any app (Chrome, Google Drive, Word…) can print to Prisca, with your margins and settings. Windows asks for permission once.';
+  pr.onclick = () => { m.hidden = true; setupPriscaPrinter(priscaPrinter.printer ? 'remove' : 'add'); };
+  m.appendChild(pr);
+  const cm = document.createElement('button');
+  cm.setAttribute('role', 'menuitemcheckbox');
+  cm.setAttribute('aria-checked', String(settings.contextMenu));
+  cm.textContent = (settings.contextMenu ? '✓ ' : '') + 'Show Prisca in the right-click menu';
+  cm.title = 'Print with Prisca and Open in Prisca on PDFs and pictures in File Explorer (Windows 11: under Show more options)';
+  cm.onclick = () => { m.hidden = true; setContextMenu(!settings.contextMenu, true); };
+  m.appendChild(cm);
   const bug = document.createElement('button');
   bug.textContent = 'Report a problem…';
   bug.onclick = () => { m.hidden = true; reportProblem(lastError); };
@@ -281,6 +299,22 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
   refreshThumb(page);
   showPage();
   if (at < 0) queueUpright(page);
+  return page;
+}
+
+// A page from a PDF (or printed to Prisca): kept exactly as it is, at its real size.
+// No straightening, cropping, levels or turning.
+function addDocumentPage(bitmap, dpi) {
+  const page = newPage(bitmap, dpi, settings.preset);
+  page.kind = 'doc';
+  page.document = true;
+  page.adj = { mode: 'color', auto: false, brightness: 0, contrast: 0, sharpness: 0, threshold: 50 };
+  page.uprightDone = true;
+  state.pages.push(page);
+  state.current = state.pages.length - 1;
+  renderThumbs();
+  refreshThumb(page);
+  showPage();
   return page;
 }
 
@@ -984,28 +1018,65 @@ $('copyBtn').onclick = () => { if (!state.scanning) scan({ copy: true }); };
 $('rescanBtn').onclick = () => { if (cur()) scan({ replace: cur() }); };
 
 // ---------- Importing pictures ----------
+const isPdfName = (name) => /\.pdf$/i.test(name || '');
+const isPdfBytes = (b) => b && b.length > 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46; // %PDF
+const fileName = (path) => String(path).split(/[\\/]/).pop();
+
+// Returns the pages it added.
 async function importBytes(list) {
-  let added = 0;
+  const added = [];
   for (const { bytes, name } of list) {
     try {
       const bitmap = await createImageBitmap(new Blob([bytes]));
       // Pictures have no real size: printing at true size treats them as 200 dpi.
-      if (settings.layout === 'page') { const pg = await addBitmap(bitmap, 200, settings.preset, false); if (pg) pg.picture = true; }
-      else for (const pg of (await addPieces(bitmap, 200, settings.preset, false, null, settings.layout)) || []) pg.picture = true;
-      added++;
+      if (settings.layout === 'page') { const pg = await addBitmap(bitmap, 200, settings.preset, false); if (pg) { pg.picture = true; added.push(pg); } }
+      else for (const pg of (await addPieces(bitmap, 200, settings.preset, false, null, settings.layout)) || []) { pg.picture = true; added.push(pg); }
     } catch {
-      toast(`Couldn’t open ${name}. Use PNG, JPG, BMP, WebP or GIF.`, { bad: true });
+      toast(isPdfBytes(bytes) ? `${name} is a PDF: drop it on the Prisca window or use Add pictures or PDFs.` : `Couldn’t open ${name}. Use a PDF, PNG, JPG, BMP, WebP or GIF.`, { bad: true });
     }
   }
   return added;
 }
-async function importPaths(paths) {
-  const list = [];
-  for (const path of paths) {
-    try { list.push({ bytes: await Backend.readFile(path), name: path.split(/[\\/]/).pop() }); }
-    catch (e) { toast(e.error || `Couldn’t read ${path}`, { bad: true }); }
+
+// A PDF's pages, rendered by Windows at 200 dpi (150 dpi past 30 pages, at most 150 pages).
+const PDF_MAX_PAGES = 150;
+async function importPdf(path, { label = '' } = {}) {
+  const name = label || fileName(path);
+  toast(`Opening ${name}…`, { sticky: true });
+  let r;
+  try { r = await Backend.pdfPages(path, 200, PDF_MAX_PAGES); }
+  catch (e) { toast(e.error || `Couldn’t open ${name}.`, { bad: true }); return []; }
+  if (r.ok === false) { toast(r.error || `Couldn’t open ${name}.`, { bad: true }); return []; }
+  const added = [];
+  for (let i = 0; i < r.pages.length; i++) {
+    const pg = r.pages[i];
+    toast(`Opening ${name}: page ${i + 1} of ${r.pages.length}…`, { sticky: true });
+    try {
+      const bitmap = await createImageBitmap(new Blob([await Backend.readFile(pg.path)]));
+      // Its real size: dots across ÷ inches across.
+      const dpi = Math.max(bitmap.width, bitmap.height) / Math.max(pg.wIn || 0, pg.hIn || 0) || pg.dpi || r.dpi;
+      added.push(addDocumentPage(bitmap, dpi));
+    } catch (e) { console.warn('PDF page failed', e); }
+    Backend.discard(pg.path);
   }
-  await importBytes(list);
+  const more = r.count > r.rendered ? ` (the first ${r.rendered} of ${r.count} pages)` : '';
+  if (!added.length) toast(`Couldn’t open ${name}.`, { bad: true });
+  else toast(`Added ${name}: ${added.length} ${added.length === 1 ? 'page' : 'pages'}${more}.`);
+  return added;
+}
+
+// Returns the pages it added, in order.
+async function importPaths(paths, opts = {}) {
+  const added = [];
+  for (const path of paths) {
+    if (isPdfName(path)) { added.push(...await importPdf(path, opts)); continue; }
+    let bytes;
+    try { bytes = await Backend.readFile(path); }
+    catch (e) { toast(e.error || `Couldn’t read ${path}`, { bad: true }); continue; }
+    if (isPdfBytes(bytes)) { added.push(...await importPdf(path, opts)); continue; }
+    added.push(...await importBytes([{ bytes, name: fileName(path) }]));
+  }
+  return added;
 }
 $('importBtn').onclick = async () => importPaths(await Backend.pickImages());
 Backend.onFileDrop((paths) => { $('dropVeil').hidden = true; importPaths(paths); });
@@ -1020,7 +1091,11 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     e.preventDefault();
     $('dropVeil').hidden = true;
     const list = [];
-    for (const f of e.dataTransfer.files) list.push({ bytes: new Uint8Array(await f.arrayBuffer()), name: f.name });
+    for (const f of e.dataTransfer.files) {
+      // Preview only: PDFs go through the stand-in renderer.
+      if (isPdfName(f.name)) { await importPaths([`mock://${f.name}`]); continue; }
+      list.push({ bytes: new Uint8Array(await f.arrayBuffer()), name: f.name });
+    }
     importBytes(list);
   });
 }
@@ -1301,6 +1376,91 @@ function toast(text, { bad = false, action = '', onAction = null, sticky = false
   if (!sticky) toastTimer = setTimeout(() => { t.hidden = true; }, bad ? Math.max(duration, 7000) : duration);
 }
 
+// ---------- Files from outside: right-click menu, the Prisca printer ----------
+// "--print <file>" / "--add <file>" come from the right-click menu (one start per
+// file, all handed to this window), "--inbox" from the Prisca printer's task.
+let argQueue = { add: [], print: [], inbox: false }, argTimer = null;
+function handleArgs(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if ((a === '--print' || a === '--add') && argv[i + 1]) { argQueue[a.slice(2)].push(argv[++i]); }
+    else if (a === '--inbox') argQueue.inbox = true;
+    else if (!a.startsWith('--')) argQueue.add.push(a); // "Open with" passes the file alone
+  }
+  clearTimeout(argTimer);
+  argTimer = setTimeout(runArgs, 400);
+}
+let runningArgs = false;
+async function runArgs() {
+  if (runningArgs || state.scanning || state.saving) { argTimer = setTimeout(runArgs, 800); return; }
+  runningArgs = true;
+  const q = argQueue;
+  argQueue = { add: [], print: [], inbox: false };
+  try {
+    if (q.add.length) await importPaths(q.add);
+    if (q.print.length) await printFiles(await importPaths(q.print));
+    if (q.inbox) await checkInbox();
+  } finally { runningArgs = false; }
+}
+// New pages straight into the print panel, with just those pages picked.
+async function printFiles(pages, from = '') {
+  if (!pages.length) return;
+  const first = state.pages.indexOf(pages[0]) + 1, last = state.pages.indexOf(pages[pages.length - 1]) + 1;
+  if (PrintPanel.isOpen()) PrintPanel.close();
+  await PrintPanel.open({ pages: first === last ? String(first) : `${first}-${last}`, job: pages, from });
+}
+let inboxBusy = false;
+async function checkInbox() {
+  if (inboxBusy) return;
+  inboxBusy = true;
+  try {
+    const r = await Backend.inboxTake();
+    if (r.files && r.files.length) {
+      const pages = [];
+      for (const f of r.files) { pages.push(...await importPdf(f, { label: 'the printed document' })); Backend.discard(f); }
+      if (pages.length) await printFiles(pages, 'printer');
+    }
+    // Windows is still writing a job: look again soon.
+    if (r.waiting) setTimeout(checkInbox, 1200);
+  } finally { inboxBusy = false; }
+}
+// While Prisca is open it picks up print jobs itself (the task only matters when it's closed).
+let inboxPoll = null;
+function startInboxPoll() {
+  clearInterval(inboxPoll);
+  if (priscaPrinter.printer) inboxPoll = setInterval(() => { if (!state.scanning && !state.saving && !runningArgs) checkInbox(); }, 2000);
+}
+
+let priscaPrinter = { printer: false, task: false };
+async function loadPriscaPrinter() {
+  try { priscaPrinter = await Backend.printerSetupState(); } catch { priscaPrinter = { printer: false, task: false }; }
+  startInboxPoll();
+}
+async function setupPriscaPrinter(mode) {
+  toast(mode === 'add' ? 'Adding the Prisca printer. Windows will ask for permission…' : 'Removing the Prisca printer. Windows will ask for permission…', { sticky: true });
+  try {
+    priscaPrinter = await Backend.printerSetup(mode);
+    startInboxPoll();
+    if (mode === 'add') {
+      toast(priscaPrinter.task && !priscaPrinter.taskError
+        ? 'Prisca is now a printer. Pick “Prisca” in any app’s print dialog (in Chrome: Destination › See more); Prisca opens with your settings.'
+        : 'Prisca is now a printer. Pick “Prisca” in any app’s print dialog. Couldn’t set Prisca to open by itself, so keep it open while you print.', { duration: 12000 });
+    } else toast('The Prisca printer is removed.');
+  } catch (e) {
+    toast(e.error || 'Couldn’t change the Prisca printer.', { bad: true });
+    loadPriscaPrinter();
+  }
+}
+async function setContextMenu(on, tell = false) {
+  try {
+    await Backend.contextMenu(on);
+    settings.contextMenu = on;
+    saveSettings();
+    if (tell) toast(on ? 'Right-click a PDF or picture: Print with Prisca, or Open in Prisca (Windows 11: under Show more options).' : 'Removed Prisca from the right-click menu.', { duration: 8000 });
+  } catch (e) { if (tell) toast(e.error || 'Couldn’t change the right-click menu.', { bad: true }); }
+}
+Backend.onArgs(handleArgs);
+
 // ---------- Keyboard ----------
 const isTyping = (el) => el && (el.tagName === 'INPUT' && el.type === 'text');
 window.addEventListener('keydown', (e) => {
@@ -1369,6 +1529,11 @@ window.addEventListener('contextmenu', (e) => { if (!isTyping(e.target)) e.preve
   showPage();
   await suggestName();
   loadDevices();
+  // Keep the right-click menu pointing at this copy of Prisca (it moves when updated or reinstalled).
+  if (settings.contextMenu && Backend.inApp) setContextMenu(true);
+  loadPriscaPrinter().then(() => { if (priscaPrinter.printer) checkInbox(); });
+  const args = await Backend.startupArgs();
+  if (args && args.length) handleArgs(args);
   setTimeout(checkForUpdate, 4000);
 })();
 
