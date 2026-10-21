@@ -73,6 +73,18 @@ const Backend = (() => {
     printerSetupState: () => call('printer_setup_state'),
     printerSetup: (mode) => call('printer_setup', { mode }),
     contextMenu: (on) => call('context_menu', { on }),
+    // Tray, shortcut, start with Windows; print history; printer queue; clipboard.
+    showWindow: () => call('show_window').catch(() => {}),
+    setKeepInTray: (on) => call('set_keep_in_tray', { on }).catch(() => {}),
+    setAutostart: (on) => call('set_autostart', { on }),
+    autostartState: () => call('autostart_state').catch(() => false),
+    setScanHotkey: (on) => call('set_scan_hotkey', { on }),
+    onScanKey: (fn) => { T.event.listen('prisca://scan', () => fn()); },
+    historyDir: () => call('history_dir'),
+    historyDelete: (path) => call('history_delete', { path }).catch(() => {}),
+    printQueue: async (printer) => toArray((await call('print_queue', { printer })).jobs),
+    printQueueCancel: async (printer, id) => { const r = await call('print_queue_cancel', { printer, id }); return { ...r, jobs: toArray(r.jobs) }; },
+    copyFiles: (paths) => call('copy_files', { paths }),
     // A newer published version, or null (also null when updates aren't set up).
     checkUpdate: async () => {
       try { return T.updater ? await T.updater.check() : null; } catch { return null; }
@@ -116,11 +128,12 @@ const Backend = (() => {
     saveFile: async (path, bytes) => {
       window.PRISCA_SAVED = window.PRISCA_SAVED || [];
       window.PRISCA_SAVED.push({ path, size: bytes.length, bytes });
+      files.set(path, bytes);
       return path;
     },
     defaultFolder: async () => 'C:\\Users\\you\\Documents\\Prisca',
     nextNumber: async () => 1,
-    exists: async () => false,
+    exists: async (path) => files.has(path),
     pickFolder: async () => null,
     pickImages: async () => [],
     reveal: async () => {},
@@ -160,6 +173,22 @@ const Backend = (() => {
     printerSetupState: async () => window.PRISCA_MOCK_PRINTER_STATE || { printer: false, task: false },
     printerSetup: async (mode) => { window.PRISCA_MOCK_PRINTER_STATE = { printer: mode !== 'remove', task: mode !== 'remove', taskError: '' }; return window.PRISCA_MOCK_PRINTER_STATE; },
     contextMenu: async (on) => { window.PRISCA_MOCK_MENU = on; return on; },
+    showWindow: async () => { window.PRISCA_SHOWN = (window.PRISCA_SHOWN || 0) + 1; },
+    setKeepInTray: async (on) => { window.PRISCA_MOCK_TRAY = on; },
+    setAutostart: async (on) => { window.PRISCA_MOCK_AUTOSTART = on; return on; },
+    autostartState: async () => !!window.PRISCA_MOCK_AUTOSTART,
+    setScanHotkey: async (on) => { if (on && window.PRISCA_MOCK_HOTKEY_TAKEN) throw { error: 'Ctrl+Alt+S is already used by another app, so it can’t scan from anywhere.' }; window.PRISCA_MOCK_HOTKEY = on; return on; },
+    onScanKey: (fn) => { window.PRISCA_SCAN_KEY = fn; },
+    historyDir: async () => 'mock://history',
+    historyDelete: async (path) => { files.delete(path); (window.PRISCA_DELETED = window.PRISCA_DELETED || []).push(path); },
+    printQueue: async () => (window.PRISCA_MOCK_QUEUE || []).slice(),
+    printQueueCancel: async (printer, id) => {
+      const q = window.PRISCA_MOCK_QUEUE || [];
+      const n = id ? q.filter((j) => j.id === id).length : q.length;
+      window.PRISCA_MOCK_QUEUE = id ? q.filter((j) => j.id !== id) : [];
+      return { cancelled: n, failed: 0, jobs: window.PRISCA_MOCK_QUEUE.slice() };
+    },
+    copyFiles: async (paths) => { window.PRISCA_COPIED = paths; return { copied: paths.length }; },
     print: async (job) => {
       if (window.PRISCA_MOCK_PRINT_FAIL) throw { code: 'print', error: window.PRISCA_MOCK_PRINT_FAIL };
       (window.PRISCA_PRINTED = window.PRISCA_PRINTED || []).push(job);

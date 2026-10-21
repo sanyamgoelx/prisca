@@ -1,6 +1,14 @@
 # Prisca
 
-Fast scanning for any scanner or all-in-one printer on Windows (Pri + Sca: Printer + Scanner). A modern replacement for the scan software that came with the printer.
+Printing and scanning for any printer, scanner or all-in-one on Windows (Pri + Sca: Printer + Scanner). A modern replacement for the software that came with the printer. Two modes, **Print** (Ctrl+1) and **Scan** (Ctrl+2).
+
+## Print
+- **Print job**: add PDFs, pictures and your scans; pick pages from each (click pages, or All / None / Odd / Even), turn pages, reorder files, and print them all in one go. Each file starts on a new sheet, or runs on from the last. **Save as one PDF** keeps the picked pages as a file instead.
+- **Print again**: every printed job is kept (the last 20) with its pages and settings, to print again in one click.
+- **The printer's queue**: see what's waiting, cancel one job or all, spot stuck ones.
+- Settings are shared with the print panel below (margins in mm, anchor, setups…).
+
+## Scan
 
 - **Space** scans the next page. Pages pile up in the batch on the left, already cropped and straightened.
 - Presets: Document (grey, 200 dpi), Receipt (black and white, 300 dpi), Photo (colour, 300 dpi). Resolution is adjustable.
@@ -17,6 +25,11 @@ Fast scanning for any scanner or all-in-one printer on Windows (Pri + Sca: Print
 - Drop pictures (or **Add pictures or PDFs**) to clean up photos of documents the same way. **PDFs** open as pages at their real size (Windows' own PDF renderer), untouched, ready to print with Prisca's margins and anchor.
 - **Prisca as a printer** (scanner menu › *Add Prisca as a printer…*, Windows asks for permission once): pick *Prisca* in any app's print dialog (Chrome / Google Drive: *Destination › See more*) and the document opens in Prisca's print panel. Prisca opens by itself when a job arrives.
 - **Right-click menu**: *Print with Prisca* and *Open in Prisca* on PDFs and pictures (Windows 11: under *Show more options*). Can be turned off in the scanner menu.
+- **ID card copy** (layout menu): scan the front, turn the card over, scan the back; both land on one page at their real size, ready for the *ID card copy* print setup.
+- Saving: a **size limit** for upload forms (under 200 KB / 500 KB / 1 MB: Prisca lowers picture quality, then resolution), **sort into folders by type** (the folder follows the name: Invoices, Bills, Receipts, IDs…) and **copy the file after saving** to paste into WhatsApp or an email.
+
+## With Windows (settings menu, top right)
+- Add Prisca as a printer · right-click menu · **keep Prisca in the tray** when closed · **start with Windows** (in the tray) · **Ctrl+Alt+S scans from anywhere** (off by default; only that key combination is taken).
 - Updates install themselves.
 
 ## Download
@@ -26,7 +39,7 @@ Get `Prisca_…_x64-setup.exe` from [Releases](../../releases/latest). Windows m
 Through Windows Image Acquisition (WIA), which every scanner driver on Windows provides. No vendor software needed; the scanner only needs its Windows driver. `check-scanner.cmd` lists what Windows can see; the scanner menu in Prisca can save a scanner report for odd drivers.
 
 ## Keys
-Space scan · Shift+Space scan the current page again · Esc cancel scan · Ctrl+S save · Ctrl+Shift+S save and start a new batch · Ctrl+P print · Ctrl+Shift+P print again with the last settings · R / Shift+R turn · C crop · Delete remove page (Ctrl+Z brings it back) · ↑ ↓ pick page
+Ctrl+1 Print · Ctrl+2 Scan · Space scan · Shift+Space scan the current page again · Esc cancel scan · Ctrl+S save · Ctrl+Shift+S save and start a new batch · Ctrl+P print · Ctrl+Shift+P print again with the last settings · R / Shift+R turn · C crop · Delete remove page (Ctrl+Z brings it back) · ↑ ↓ pick page
 
 ## Build
 - `run-dev.cmd`: start a development build.

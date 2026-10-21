@@ -170,7 +170,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
 
   const P = {
     open: false, busy: false, printers: [], printer: '', info: null, infoCache: new Map(),
-    opts: cleanOpts(), profile: '', pagesText: 'All', sheet: 0, step: null, naming: false,
+    opts: cleanOpts(), profile: '', pagesText: 'All', sheet: 0, step: null, naming: false, mode: 'batch', queue: [], queueOpen: false,
     previews: new Map(),
   };
   const el = (id) => document.getElementById(id);
@@ -206,6 +206,8 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
   async function usePrinter(name) {
     P.printer = name;
+    P.queue = [];
+    if (P.open) setTimeout(loadQueue, 0);
     P.info = null;
     P.infoError = '';
     P.opts = cleanOpts(store().byPrinter[name] || DEFAULTS);
@@ -256,7 +258,17 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     const pages = list || state.pages;
     const idx = list ? pages.map((_, i) => i) : PrintLayout.parsePages(P.pagesText, pages.length);
     if (!idx) return null;
-    return idx.map((i) => ({ ...pageMM(pages[i]), index: i, ref: pages[i] }));
+    return idx.map((i) => ({ ...pageMM(pages[i]), index: i, ref: pages[i], label: `page ${i + 1}` }));
+  }
+  // Pages to print, in groups that each start on a new sheet: the batch (one group),
+  // or the Print job (one group per file, or one for all when files run on).
+  function groupsFor(list) {
+    if (!list && P.mode === 'job') {
+      const gs = Job.groups();
+      return Job.breaks() === 'flow' && gs.length ? [gs.flat()] : gs;
+    }
+    const sel = selection(list);
+    return sel ? [sel] : null;
   }
   function paperOf(info, o) {
     const size = info && info.sizes.find((s) => s.kind === o.paper);
@@ -264,9 +276,11 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
   const hardOf = (info) => (info && info.hard) || { t: 0, r: 0, b: 0, l: 0 };
   function plan(list, o = P.opts, info = P.info) {
-    const sel = selection(list);
-    if (!sel || !sel.length) return null;
-    const sheets = PrintLayout.sheets(sel, o, paperOf(info, o), hardOf(info));
+    const gs = groupsFor(list);
+    if (!gs) return null;
+    const sel = gs.flat();
+    if (!sel.length) return null;
+    const sheets = gs.flatMap((g) => PrintLayout.sheets(g, o, paperOf(info, o), hardOf(info)));
     return { sel, sheets, check: PrintLayout.check(sheets) };
   }
 
@@ -366,6 +380,11 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     el('prInk').querySelector('[data-v="colour"]').title = info && !info.color ? 'This printer prints in black only' : '';
     if (document.activeElement !== el('prCopies')) el('prCopies').value = o.copies;
     if (document.activeElement !== el('prPages')) el('prPages').value = P.pagesText;
+    el('prPagesField').hidden = P.mode === 'job';
+    el('prBreakRow').hidden = P.mode !== 'job';
+    seg('prBreak', store().fileBreak === 'flow' ? 'flow' : 'new');
+    el('printPanel').classList.toggle('job', P.mode === 'job');
+    renderQueue();
     el('prDuplex').setAttribute('aria-checked', String(o.duplex));
     el('prDuplexNote').textContent = info && info.duplex
       ? 'This printer can print both sides itself, but Prisca turns the stack by hand: it prints the fronts, then shows how to put the stack back.'
@@ -380,7 +399,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     const n = state.pages.length;
     if (!pl) {
       el('prGoLabel').textContent = 'Print';
-      el('prSub').textContent = n ? 'Pages: use numbers like 1-3, 5' : 'Nothing to print';
+      el('prSub').textContent = P.mode === 'job' ? (Job.count() ? 'No pages picked' : 'Add files to print') : n ? 'Pages: use numbers like 1-3, 5' : 'Nothing to print';
       go.disabled = true;
     } else {
       const pass = PrintLayout.passes(pl.sheets, o.copies, o.duplex, o.reverse);
@@ -404,12 +423,45 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     const strip = el('prSheets');
     strip.innerHTML = '';
     el('prWarn').innerHTML = '';
-    if (!pl) { sheetEl.hidden = true; el('prPaperLine').textContent = ''; addWarn(state.pages.length ? 'Pages: use numbers like 1-3, 5 (this batch has ' + state.pages.length + ').' : 'Nothing to print.', true); return; }
+    if (!pl) {
+      sheetEl.hidden = true;
+      el('prPaperLine').textContent = '';
+      if (P.mode === 'job') addWarn(Job.count() ? 'No pages picked: choose some pages to print.' : 'Add files on the left (or drop them here) to print them.', !!Job.count());
+      else addWarn(state.pages.length ? 'Pages: use numbers like 1-3, 5 (this batch has ' + state.pages.length + ').' : 'Nothing to print.', true);
+      return;
+    }
     sheetEl.hidden = false;
     P.sheet = Math.max(0, Math.min(P.sheet, pl.sheets.length - 1));
     const sh = pl.sheets[P.sheet], o = P.opts;
     const size = P.info && P.info.sizes.find((s) => s.kind === o.paper);
     el('prPaperLine').textContent = `${size ? size.name : o.paperName} ${sh.landscape ? 'landscape' : 'portrait'} · ${r1(sh.pw)}×${r1(sh.ph)} mm · inside margins ${r1(Math.max(0, sh.area.w))}×${r1(Math.max(0, sh.area.h))}`;
+    // Sheet strip
+    if (pl.sheets.length > 1) {
+      pl.sheets.forEach((s, i) => {
+        const b = document.createElement('button');
+        b.className = 'pr-sheet-btn';
+        b.setAttribute('aria-pressed', String(i === P.sheet));
+        const labels = s.items.map((it) => it.page.label || `page ${it.page.index + 1}`);
+        b.innerHTML = `<span class="mono">Sheet ${i + 1}</span><small></small>`;
+        b.lastChild.textContent = labels.length > 1 ? `${labels[0]} – ${labels[labels.length - 1]}` : labels[0];
+        b.title = labels.join(', ');
+        b.onclick = () => { P.sheet = i; render(); };
+        strip.appendChild(b);
+      });
+    }
+    // Warnings: what won't come out as shown.
+    const c = pl.check;
+    if (!c.valid) addWarn('The margins leave no room for the page. Make them smaller.', true);
+    if (c.lost > 0.2) addWarn(`The printer can’t reach the hatched edge, so ${r1(c.lost)} mm of the page won’t print there. Raise that margin, move the anchor or use Fit.`, true);
+    if (c.trimmed > 0.2) addWarn(o.mode === 'fill' ? `Fill trims up to ${r1(c.trimmed)} mm off the page’s edges to cover the margins.` : `The page is bigger than the space inside your margins: up to ${r1(c.trimmed)} mm is cut off. Use Fit or a smaller size.`, o.mode !== 'fill');
+    const small = [];
+    const hd0 = hardOf(P.info);
+    if (P.info) for (const [k, name] of [['t', 'top'], ['r', 'right'], ['b', 'bottom'], ['l', 'left']]) if (o.m[k] < hd0[k] - 0.05) small.push(`${name} ${r1(hd0[k])}`);
+    if (small.length && c.lost <= 0.2) addWarn(`Some margins are smaller than this printer can print (${small.join(', ')} mm), but nothing on the page lands there.`, false);
+    const pictures = pl.sel.some((s) => s.ref.picture);
+    if ((o.mode === 'actual' || o.mode === 'custom') && pictures) addWarn('Added pictures have no real size; True size treats them as 200 dpi.', false);
+    else if (o.mode === 'actual' && c.valid && c.lost <= 0.2 && c.trimmed <= 0.2) addWarn('True size: 1 cm on the original is 1 cm on paper.', false);
+    // Sized after the strip and warnings are in, so the sheet fits what's left.
     const k = Math.min((stage.clientWidth - 56) / sh.pw, (stage.clientHeight - 56) / sh.ph);
     const px = (mm) => `${(mm * k).toFixed(2)}px`;
     sheetEl.style.width = px(sh.pw);
@@ -443,30 +495,6 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       Object.assign(d.style, { left: px(it.anchor.x), top: px(it.anchor.y) });
       sheetEl.appendChild(d);
     }
-    // Sheet strip
-    if (pl.sheets.length > 1) {
-      pl.sheets.forEach((s, i) => {
-        const b = document.createElement('button');
-        b.className = 'pr-sheet-btn';
-        b.setAttribute('aria-pressed', String(i === P.sheet));
-        const nums = s.items.map((it) => it.page.index + 1);
-        b.innerHTML = `<span class="mono">Sheet ${i + 1}</span><small>${nums.length > 1 ? `pages ${nums[0]}–${nums[nums.length - 1]}` : `page ${nums[0]}`}</small>`;
-        b.onclick = () => { P.sheet = i; render(); };
-        strip.appendChild(b);
-      });
-    }
-    // Warnings: what won't come out as shown.
-    const c = pl.check;
-    if (!c.valid) addWarn('The margins leave no room for the page. Make them smaller.', true);
-    if (c.lost > 0.2) addWarn(`The printer can’t reach the hatched edge, so ${r1(c.lost)} mm of the page won’t print there. Raise that margin, move the anchor or use Fit.`, true);
-    if (c.trimmed > 0.2) addWarn(o.mode === 'fill' ? `Fill trims up to ${r1(c.trimmed)} mm off the page’s edges to cover the margins.` : `The page is bigger than the space inside your margins: up to ${r1(c.trimmed)} mm is cut off. Use Fit or a smaller size.`, o.mode !== 'fill');
-    const small = [];
-    const hd0 = hardOf(P.info);
-    if (P.info) for (const [k, name] of [['t', 'top'], ['r', 'right'], ['b', 'bottom'], ['l', 'left']]) if (o.m[k] < hd0[k] - 0.05) small.push(`${name} ${r1(hd0[k])}`);
-    if (small.length && c.lost <= 0.2) addWarn(`Some margins are smaller than this printer can print (${small.join(', ')} mm), but nothing on the page lands there.`, false);
-    const pictures = pl.sel.some((s) => s.ref.picture);
-    if ((o.mode === 'actual' || o.mode === 'custom') && pictures) addWarn('Added pictures have no real size; True size treats them as 200 dpi.', false);
-    else if (o.mode === 'actual' && c.valid && c.lost <= 0.2 && c.trimmed <= 0.2) addWarn('True size: 1 cm on the original is 1 cm on paper.', false);
   }
   function addWarn(text, bad) {
     const d = document.createElement('div');
@@ -523,7 +551,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       const cur = need.get(it.page.ref);
       need.set(it.page.ref, Math.max(cur || 0, px));
     }
-    const paths = new Map();
+    const staged = new Map();
     let i = 0;
     for (const [page, px] of need) {
       i++;
@@ -532,10 +560,10 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       const c = Imaging.render(page, Math.max(600, Math.round(px)));
       if (ink !== 'colour') inkify(c, ink);
       const bytes = new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', 0.92)).arrayBuffer());
+      staged.set(page, { path: await Backend.stagePrint(bytes), bytes, w: c.width, h: c.height });
       c.width = c.height = 0;
-      paths.set(page, await Backend.stagePrint(bytes));
     }
-    return paths;
+    return staged;
   }
   function inkify(c, ink) {
     const g = c.getContext('2d', { willReadFrequently: true });
@@ -550,17 +578,30 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
   function jobSheets(list, paths) {
     return list.map((sh) => sh
-      ? { landscape: sh.landscape, items: sh.items.map((it) => ({ path: paths.get(it.page.ref), x: it.x, y: it.y, w: it.w, h: it.h, cx: it.clip.x, cy: it.clip.y, cw: it.clip.w, ch: it.clip.h })) }
+      ? { landscape: sh.landscape, items: sh.items.map((it) => ({ path: paths.get(it.page.ref).path, x: it.x, y: it.y, w: it.w, h: it.h, cx: it.clip.x, cy: it.clip.y, cw: it.clip.w, ch: it.clip.h })) }
       : { landscape: false, items: [] });
   }
-  async function send(printer, info, o, list, copies, paths) {
+  async function send(printer, info, o, list, copies, paths, title) {
     const job = {
       printer, paper: o.paper, color: o.ink === 'colour' && !!info.color, draft: o.ink === 'draft',
-      copies, title: `Prisca ${($('fileName') && $('fileName').value) || 'scan'}`, sheets: jobSheets(list, paths),
+      copies, title: `Prisca ${title}`, sheets: jobSheets(list, paths),
     };
     return Backend.print(job);
   }
-  const discardAll = (paths) => { for (const p of paths.values()) Backend.discard(p); };
+  const discardAll = (paths) => { for (const p of paths.values()) Backend.discard(p.path); };
+  // What the job is called (Windows' queue, Print again).
+  const jobTitle = (list) => (!list && P.mode === 'job' ? Job.title() : (($('fileName') && $('fileName').value) || 'Scans'));
+  // Keep exactly what was sent, for Print again.
+  function keep(pl, staged, printer, o, sheets, title) {
+    const seen = new Set(), pages = [];
+    for (const s of pl.sel) {
+      const st = staged.get(s.ref);
+      if (!st || seen.has(s.ref)) continue;
+      seen.add(s.ref);
+      pages.push({ jpeg: st.bytes, width: st.w, height: st.h, dpi: st.w / (s.w / 25.4) });
+    }
+    Job.record({ title, pages, sheets, printer, opts: clone(o) });
+  }
 
   async function run(list, o, printer, info, { closeAfter = true } = {}) {
     const pl = plan(list, o, info);
@@ -569,14 +610,16 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     const pass = PrintLayout.passes(pl.sheets, o.copies, o.duplex, o.reverse);
     P.busy = true; render();
     let paths = new Map();
+    const title = jobTitle(list);
     try {
       paths = await stagePages([pass.fronts, pass.backs], o.ink, 'Printing');
       toast(`Sending to ${printer}…`, { sticky: true });
-      const r = await send(printer, info, o, pass.fronts, pass.copies, paths);
+      const r = await send(printer, info, o, pass.fronts, pass.copies, paths, title);
       const sent = (r && r.sheets) || pass.fronts.length;
+      keep(pl, paths, printer, o, pass.paper, title);
       if (o.duplex && pass.backs.length) {
         P.step = {
-          backs: pass.backs, paths, printer, info, o: clone(o),
+          backs: pass.backs, paths, printer, info, o: clone(o), title,
           text: `Fronts sent (${sent} ${sent === 1 ? 'sheet' : 'sheets'}). When they’re out, put the whole stack back in the paper tray so the blank sides get printed, tops going in first as before${o.reverse ? ', without re-sorting it' : ''}.${pass.blanks ? (pass.blanks > 1 ? ' The last sheet of each copy keeps a blank back so the stack stays in step.' : ' The last sheet keeps a blank back so the stack stays in step.') : ''} First time with this printer? Try it with 2 sheets.`,
         };
         $('toast').hidden = true;
@@ -584,15 +627,9 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       }
       discardAll(paths);
       const copiesNote = pass.copies > 1 ? ` × ${pass.copies} copies` : '';
-      const job = P.job && P.job.filter((pg) => state.pages.includes(pg));
-      if (job && job.length && closeAfter) {
-        // Pages that only came in to be printed: offer to take them out of the batch again.
-        toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`, {
-          action: `Remove ${job.length === 1 ? 'that page' : `those ${job.length} pages`} from the batch`, duration: 10000,
-          onAction: () => { for (const pg of job) { const i = state.pages.indexOf(pg); if (i >= 0) removePage(i, { undoable: false }); } },
-        });
-      } else toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`);
-      if (closeAfter) close();
+      toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`, { action: 'Show the queue', onAction: () => { if (P.open) { P.queueOpen = true; loadQueue(); } } });
+      if (closeAfter && P.mode === 'batch') close();
+      else loadQueue();
       return true;
     } catch (e) {
       discardAll(paths);
@@ -608,12 +645,12 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     P.busy = true; render();
     try {
       toast(`Sending the backs to ${st.printer}…`, { sticky: true });
-      const r = await send(st.printer, st.info, st.o, st.backs, 1, st.paths);
+      const r = await send(st.printer, st.info, st.o, st.backs, 1, st.paths, st.title);
       const sent = (r && r.sheets) || st.backs.length;
       discardAll(st.paths);
       P.step = null;
       toast(`Sent ${sent} ${sent === 1 ? 'back' : 'backs'} to ${st.printer}.`);
-      close();
+      if (P.mode === 'batch') close();
     } catch (e) {
       toast(e.error || 'Couldn’t print the backs.', { bad: true });
     } finally { P.busy = false; render(); }
@@ -627,29 +664,122 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
 
   // ---------- Open / close / quick print ----------
-  // opts.pages: preselect those pages ("4-6"); opts.job: the pages that came in just to be printed.
+  // The scan batch (Ctrl+P in Scan). opts.pages: preselect those pages ("4"); opts.profile: use that setup.
   async function open(opts = {}) {
     if (P.open) return;
-    P.job = opts.job || null;
-    if (opts.pages) P.pagesText = opts.pages;
     if (!state.pages.length) { toast('Scan or add a page first.'); return; }
     if (state.scanning || state.saving) return;
     if (state.cropping) finishCrop();
+    P.mode = 'batch';
+    P.tempPages = !!opts.pages;
+    if (opts.pages) P.pagesText = opts.pages;
+    await show();
+    const pf = opts.profile && store().profiles.find((x) => x.name === opts.profile);
+    if (pf && P.open) applyProfile(pf);
+  }
+  // Print mode: the Print job, always open until you switch to Scan.
+  async function openJob() {
+    if (P.open && P.mode === 'job') return;
+    if (P.open) close();
+    P.mode = 'job';
+    await show();
+  }
+  async function show() {
     P.open = true; P.sheet = 0; P.naming = false;
     el('printPanel').hidden = false;
     document.body.classList.add('printing');
+    if (P.mode === 'job') Job.render();
     render();
     await loadPrinters();
     if (!P.open) return;
     await usePrinter(pickPrinter());
+    startQueueWatch();
   }
   function close() {
     if (!P.open) return;
     if (P.step) cancelStep();
     P.open = false;
-    if (P.job) { P.job = null; P.pagesText = 'All'; }
+    if (P.tempPages) { P.tempPages = false; P.pagesText = 'All'; }
+    P.mode = 'batch';
+    clearInterval(P.queueTimer);
     el('printPanel').hidden = true;
+    el('printPanel').classList.remove('job');
     document.body.classList.remove('printing');
+  }
+  // Print again: that printer (when it's still there) and the settings the job was printed with.
+  async function useSettings(printer, opts) {
+    if (!P.printers.length) await loadPrinters();
+    const name = P.printers.some((p) => p.name === printer) ? printer : P.printer || pickPrinter();
+    if (name !== P.printer) await usePrinter(name);
+    P.opts = cleanOpts({ ...opts, duplex: opts.duplex, copies: opts.copies });
+    if (P.info) { const size = matchPaper(P.info, P.opts); if (size && size.kind !== P.opts.paper) await usePaper(size.kind); }
+    changed();
+  }
+
+  // ---------- The printer's queue (what Windows is holding) ----------
+  async function loadQueue() {
+    if (!P.printer || P.busy) return;
+    const name = P.printer;
+    try {
+      const jobs = await Backend.printQueue(name);
+      if (P.printer === name) { P.queue = jobs; P.queueError = ''; }
+    } catch (e) { P.queueError = e.error || 'Couldn’t read the printer’s queue.'; }
+    renderQueue();
+  }
+  function startQueueWatch() {
+    clearInterval(P.queueTimer);
+    loadQueue();
+    P.queueTimer = setInterval(() => { if (P.open && !document.hidden) loadQueue(); }, 4000);
+  }
+  async function cancelQueue(id) {
+    try {
+      const r = await Backend.printQueueCancel(P.printer, id);
+      P.queue = r.jobs || [];
+      toast(r.failed
+        ? `Cancelled ${r.cancelled}; ${r.failed} couldn’t be cancelled (someone else’s job needs administrator rights).`
+        : `Cancelled ${r.cancelled} ${r.cancelled === 1 ? 'job' : 'jobs'}.`, { bad: !!r.failed });
+    } catch (e) { toast(e.error || 'Couldn’t cancel.', { bad: true }); }
+    renderQueue();
+  }
+  function renderQueue() {
+    const box = el('prQueue');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!P.printer) return;
+    const q = P.queue || [];
+    const head = document.createElement('button');
+    head.className = 'pr-queue-head';
+    const stuck = q.some((j) => /error|paused|blocked|offline|deleting/i.test(j.status));
+    head.textContent = P.queueError ? 'Queue: couldn’t read it' : q.length ? `${q.length} ${q.length === 1 ? 'job' : 'jobs'} waiting${stuck ? ' · stuck' : ''} · ${P.queueOpen ? 'Hide' : 'Show'}` : 'Nothing waiting in the queue';
+    head.classList.toggle('warn', stuck);
+    head.disabled = !q.length;
+    head.onclick = () => { P.queueOpen = !P.queueOpen; renderQueue(); };
+    box.appendChild(head);
+    if (!q.length || !P.queueOpen) return;
+    for (const j of q) {
+      const row = document.createElement('div');
+      row.className = 'pr-queue-row';
+      const t = document.createElement('span');
+      t.textContent = j.name || 'Untitled';
+      t.title = `${j.name} · ${j.owner || ''}`;
+      const m = document.createElement('small');
+      m.textContent = `${j.status || 'Waiting'}${j.pages ? ` · ${j.printed || 0}/${j.pages} pages` : ''}${j.at ? ` · ${j.at}` : ''}`;
+      const info = document.createElement('div');
+      info.append(t, m);
+      const c = document.createElement('button');
+      c.className = 'ghost';
+      c.textContent = 'Cancel';
+      c.onclick = () => cancelQueue(j.id);
+      row.append(info, c);
+      box.appendChild(row);
+    }
+    if (q.length > 1) {
+      const all = document.createElement('button');
+      all.className = 'ghost pr-queue-all';
+      all.textContent = `Cancel all ${q.length}`;
+      all.onclick = () => cancelQueue(0);
+      box.appendChild(all);
+    }
   }
   // Ctrl+Shift+P and Copy: print straight away with this printer's saved settings.
   async function quick(list) {
@@ -720,6 +850,14 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     el('prCopies').addEventListener('input', (e) => { if (e.target.value === '') return; P.opts.copies = Math.max(1, Math.min(99, Math.round(num(e.target.value, 1)))); changed({ keepProfile: true }); });
     el('prCopies').addEventListener('blur', () => render());
     el('prPages').addEventListener('input', (e) => { P.pagesText = e.target.value; P.sheet = 0; render(); });
+    el('prBreak').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      store().fileBreak = b.dataset.v;
+      saveSettings();
+      P.sheet = 0;
+      render();
+    });
     el('prDuplex').onclick = () => { P.opts.duplex = !P.opts.duplex; changed({ keepProfile: true }); };
     el('prReverse').onchange = (e) => { P.opts.reverse = e.target.checked; changed({ keepProfile: true }); };
     el('prGo').onclick = () => run(null, P.opts, P.printer, P.info);
@@ -745,7 +883,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       e.preventDefault();
       if (P.naming) { P.naming = false; render(); return; }
       if (inField && t.id !== 'prGo') { t.blur(); return; }
-      close();
+      if (P.mode === 'batch') close();
       return;
     }
     if (inField) return;
@@ -754,6 +892,10 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   }
 
   wire();
-  return { open, close, quick, key, isOpen: () => P.open, _P: P, _plan: plan };
+  return {
+    open, openJob, close, quick, key, useSettings, pageMM,
+    refresh: () => { if (P.open) render(); },
+    isOpen: () => P.open, isJob: () => P.open && P.mode === 'job', _P: P, _plan: plan,
+  };
 })();
 if (typeof module !== 'undefined') module.exports = { PrintLayout };

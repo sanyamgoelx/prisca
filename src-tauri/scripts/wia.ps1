@@ -803,6 +803,31 @@ function Do-PriscaPrinter($req) {
     return (@{ ok = $true; taskError = $taskError } + (Get-PriscaPrinterState $inbox))
 }
 
+# ---------- The printer's queue (Windows' own list of waiting jobs) ----------
+function Get-Queue($req) {
+    $jobs = @(Get-PrintJob -PrinterName "$($req.printer)" -ErrorAction Stop)
+    $list = @()
+    foreach ($j in $jobs) {
+        $list += @{
+            id = [int]$j.Id; name = "$($j.DocumentName)"; status = "$($j.JobStatus)"
+            pages = [int]$j.TotalPages; printed = [int]$j.PagesPrinted; size = [int64]$j.Size
+            owner = "$($j.UserName)"; at = if ($j.SubmittedTime) { $j.SubmittedTime.ToString('HH:mm') } else { '' }
+        }
+    }
+    return $list
+}
+# id 0 = every job. Your own jobs can always be cancelled; other people's need administrator rights.
+function Cancel-Queue($req) {
+    $printer = "$($req.printer)"
+    $ids = if ([int]$req.id -gt 0) { @([int]$req.id) } else { @(Get-PrintJob -PrinterName $printer -ErrorAction Stop | ForEach-Object { [int]$_.Id }) }
+    $done = 0; $failed = 0
+    foreach ($i in $ids) {
+        try { Remove-PrintJob -PrinterName $printer -ID $i -ErrorAction Stop; $done++ } catch { $failed++; Log "queue: couldn't cancel job $i on '$printer': $($_.Exception.Message)" }
+    }
+    Log "queue: cancelled $done, failed $failed on '$printer'"
+    return @{ ok = $true; cancelled = $done; failed = $failed; jobs = @(Get-Queue @{ printer = $printer }) }
+}
+
 Write-Reply @{ id = 0; ok = $true; ready = $true }
 
 while ($true) {
@@ -829,6 +854,13 @@ while ($true) {
             'print'   { $r = Do-Print $req.job; $r.id = $id; Write-Reply $r }
             'pdf'     { $r = Do-Pdf $req; $r.id = $id; Write-Reply $r }
             'prisca-printer' { $r = Do-PriscaPrinter $req; $r.id = $id; Write-Reply $r }
+            'queue'   { Write-Reply @{ id = $id; ok = $true; jobs = @(Get-Queue $req) } }
+            'queue-cancel' { $r = Cancel-Queue $req; $r.id = $id; Write-Reply $r }
+            'clip-files' {
+                $paths = @($req.paths | Where-Object { Test-Path -LiteralPath "$_" })
+                if (-not $paths.Count) { Write-Reply @{ id = $id; ok = $false; code = 'missing'; error = 'The saved file is gone, so nothing was copied.' } }
+                else { Set-Clipboard -LiteralPath $paths; Write-Reply @{ id = $id; ok = $true; copied = $paths.Count } }
+            }
             'ping'    { Write-Reply @{ id = $id; ok = $true } }
             default   { Write-Reply @{ id = $id; ok = $false; code = 'badcmd'; error = "Unknown command $($req.cmd)" } }
         }

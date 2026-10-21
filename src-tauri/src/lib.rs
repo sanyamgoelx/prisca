@@ -5,7 +5,11 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tauri::ipc::{InvokeBody, Request, Response};
 use tauri::{Emitter, Manager, State};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Closing the window keeps Prisca in the tray (set by the window from its settings).
+static KEEP_IN_TRAY: AtomicBool = AtomicBool::new(false);
 
 struct AppState {
     scanner: Scanner,
@@ -101,6 +105,112 @@ async fn printer_setup(app: tauri::AppHandle, mode: String) -> Result<Value, Str
         s.printer.request(json!({ "cmd": "prisca-printer", "mode": mode, "exe": exe, "inbox": inbox }), secs(300))
     })
     .await?;
+    check(reply)
+}
+
+// ---------- Background: tray, shortcut, start with Windows ----------
+
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+/// Brings the window forward (a print job arrived while Prisca was in the tray).
+#[tauri::command]
+fn show_window(app: tauri::AppHandle) {
+    show_main(&app);
+}
+
+#[tauri::command]
+fn set_keep_in_tray(on: bool) {
+    KEEP_IN_TRAY.store(on, Ordering::SeqCst);
+}
+
+/// Starts Prisca (in the tray) when Windows starts.
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let m = app.autolaunch();
+    if on { m.enable() } else { m.disable() }.map_err(|e| e.to_string())?;
+    m.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn autostart_state(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+fn scan_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyS)
+}
+
+/// Ctrl+Alt+S from any app: Prisca comes forward and scans. Only this key combination is taken.
+#[tauri::command]
+fn set_scan_hotkey(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let gs = app.global_shortcut();
+    let sc = scan_shortcut();
+    if on {
+        if !gs.is_registered(sc) {
+            gs.register(sc).map_err(|_| "Ctrl+Alt+S is already used by another app, so it can't scan from anywhere.".to_string())?;
+        }
+    } else if gs.is_registered(sc) {
+        let _ = gs.unregister(sc);
+    }
+    Ok(on)
+}
+
+// ---------- Print history ----------
+
+fn history_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("Prisca")).join("history")
+}
+
+/// Folder that keeps a PDF of each printed job, for "Print again".
+#[tauri::command]
+fn history_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = history_path(&app);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// Deletes one old history PDF (only inside the history folder).
+#[tauri::command]
+fn history_delete(app: tauri::AppHandle, path: String) {
+    let p = PathBuf::from(&path);
+    if p.starts_with(history_path(&app)) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+// ---------- Printer queue, clipboard ----------
+
+/// What Windows is holding for a printer.
+#[tauri::command]
+async fn print_queue(app: tauri::AppHandle, printer: String) -> Result<Value, String> {
+    let reply = blocking(app, move |s| s.printer.request(json!({ "cmd": "queue", "printer": printer }), secs(60))).await?;
+    check(reply)
+}
+
+/// Cancels one job (id) or all of them (id = 0) on a printer.
+#[tauri::command]
+async fn print_queue_cancel(app: tauri::AppHandle, printer: String, id: i64) -> Result<Value, String> {
+    let reply = blocking(app, move |s| {
+        s.printer.request(json!({ "cmd": "queue-cancel", "printer": printer, "id": id }), secs(120))
+    })
+    .await?;
+    check(reply)
+}
+
+/// Puts saved files on the clipboard, to paste into WhatsApp, email or a folder.
+#[tauri::command]
+async fn copy_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<Value, String> {
+    let reply = blocking(app, move |s| s.printer.request(json!({ "cmd": "clip-files", "paths": paths }), secs(60))).await?;
     check(reply)
 }
 
@@ -434,6 +544,25 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
     builder
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--background"])))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        show_main(app);
+                        let _ = app.emit("prisca://scan", ());
+                    }
+                })
+                .build(),
+        )
+        .on_window_event(|w, e| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = e {
+                if KEEP_IN_TRAY.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = w.hide();
+                }
+            }
+        })
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -456,6 +585,44 @@ pub fn run() {
                 scan_dir,
                 startup_args: Mutex::new(useful_args(std::env::args())),
             });
+            // Tray: open, scan, quit. Closing the window can keep Prisca here (setting).
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                let open = MenuItem::with_id(app, "open", "Open Prisca", true, None::<&str>)?;
+                let scan = MenuItem::with_id(app, "scan", "Scan now (Ctrl+Alt+S)", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit Prisca", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &scan, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("main")
+                    .tooltip("Prisca")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, e| match e.id.as_ref() {
+                        "open" => show_main(app),
+                        "scan" => {
+                            show_main(app);
+                            let _ = app.emit("prisca://scan", ());
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, e| {
+                        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                            show_main(tray.app_handle());
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+            }
+            // Started with Windows: wait in the tray.
+            if std::env::args().any(|a| a == "--background") {
+                KEEP_IN_TRAY.store(true, Ordering::SeqCst);
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -482,7 +649,17 @@ pub fn run() {
             inbox_take,
             printer_setup_state,
             printer_setup,
-            context_menu
+            context_menu,
+            show_window,
+            set_keep_in_tray,
+            set_autostart,
+            autostart_state,
+            set_scan_hotkey,
+            history_dir,
+            history_delete,
+            print_queue,
+            print_queue_cancel,
+            copy_files
         ])
         .run(context)
         .expect("error while running Prisca");

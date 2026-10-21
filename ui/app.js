@@ -32,11 +32,18 @@ function loadSettings() {
     auto: !!s.auto,
     upright: s.upright !== false,
     cast: s.cast && typeof s.cast === 'object' ? s.cast : {},
-    layout: ['page', 'items', 'book'].includes(s.layout) ? s.layout : 'page',
+    layout: ['page', 'items', 'book', 'idcard'].includes(s.layout) ? s.layout : 'page',
     smartName: s.smartName !== false,
     autoDelay: [3, 5, 8, 12].includes(s.autoDelay) ? s.autoDelay : 5,
     print: s.print && typeof s.print === 'object' ? s.print : {},
     contextMenu: s.contextMenu !== false,
+    mode: s.mode === 'scan' ? 'scan' : 'print',
+    sizeLimit: [0, 200, 500, 1000].includes(s.sizeLimit) ? s.sizeLimit : 0,
+    sortByType: !!s.sortByType,
+    copyAfterSave: !!s.copyAfterSave,
+    tray: !!s.tray,
+    hotkey: !!s.hotkey,
+    recentFiles: Array.isArray(s.recentFiles) ? s.recentFiles.filter((x) => typeof x === 'string').slice(0, 8) : [],
     presets,
   };
 }
@@ -84,7 +91,13 @@ $('dpi').onchange = (e) => {
 };
 $('source').onchange = (e) => { settings.source = e.target.value; saveSettings(); updateScanBar(); };
 $('layout').value = settings.layout;
-$('layout').onchange = (e) => { settings.layout = e.target.value; saveSettings(); updateScanBar(); };
+$('layout').onchange = (e) => {
+  settings.layout = e.target.value;
+  saveSettings();
+  if (settings.layout !== 'idcard') cancelIdCard();
+  updateScanBar();
+  if (settings.layout === 'idcard') toast('ID card copy: scan the front, turn the card over, scan the back. Both land on one page at their real size.', { duration: 7000 });
+};
 
 function currentDevice() {
   return state.devices.find((d) => d.id === settings.deviceId) || state.devices[0] || null;
@@ -225,23 +238,6 @@ function openDeviceMenu() {
     rep.onclick = () => { m.hidden = true; saveScannerReport(); };
     m.appendChild(rep);
   }
-  const sep = document.createElement('div');
-  sep.className = 'menu-sep';
-  m.appendChild(sep);
-  const pr = document.createElement('button');
-  pr.textContent = priscaPrinter.printer ? 'Remove the Prisca printer…' : 'Add Prisca as a printer…';
-  pr.title = priscaPrinter.printer
-    ? 'Other apps will no longer list Prisca as a printer'
-    : 'So any app (Chrome, Google Drive, Word…) can print to Prisca, with your margins and settings. Windows asks for permission once.';
-  pr.onclick = () => { m.hidden = true; setupPriscaPrinter(priscaPrinter.printer ? 'remove' : 'add'); };
-  m.appendChild(pr);
-  const cm = document.createElement('button');
-  cm.setAttribute('role', 'menuitemcheckbox');
-  cm.setAttribute('aria-checked', String(settings.contextMenu));
-  cm.textContent = (settings.contextMenu ? '✓ ' : '') + 'Show Prisca in the right-click menu';
-  cm.title = 'Print with Prisca and Open in Prisca on PDFs and pictures in File Explorer (Windows 11: under Show more options)';
-  cm.onclick = () => { m.hidden = true; setContextMenu(!settings.contextMenu, true); };
-  m.appendChild(cm);
   const bug = document.createElement('button');
   bug.textContent = 'Report a problem…';
   bug.onclick = () => { m.hidden = true; reportProblem(lastError); };
@@ -302,14 +298,18 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
   return page;
 }
 
-// A page from a PDF (or printed to Prisca): kept exactly as it is, at its real size.
-// No straightening, cropping, levels or turning.
-function addDocumentPage(bitmap, dpi) {
+// A page from a PDF (or printed to Prisca, or an ID card sheet): kept exactly as
+// it is, at its real size. No straightening, cropping, levels or turning.
+function docPage(bitmap, dpi, extra = {}) {
   const page = newPage(bitmap, dpi, settings.preset);
   page.kind = 'doc';
   page.document = true;
   page.adj = { mode: 'color', auto: false, brightness: 0, contrast: 0, sharpness: 0, threshold: 50 };
   page.uprightDone = true;
+  return Object.assign(page, extra);
+}
+function addDocumentPage(bitmap, dpi, extra = {}) {
+  const page = docPage(bitmap, dpi, extra);
   state.pages.push(page);
   state.current = state.pages.length - 1;
   renderThumbs();
@@ -857,7 +857,9 @@ function updateScanBar() {
     $('scanLabel').textContent = `Next scan in ${autoLeft} s`;
     btn.querySelector('.key').textContent = 'Space: now';
   } else {
-    $('scanLabel').textContent = settings.source === 'feeder' ? 'Scan feeder' : `Scan page ${n}`;
+    $('scanLabel').textContent = settings.source === 'feeder' ? 'Scan feeder'
+      : settings.layout === 'idcard' ? (idFront ? 'Scan the back' : 'Scan the front')
+      : `Scan page ${n}`;
     btn.querySelector('.key').textContent = 'Space';
   }
   btn.disabled = state.saving || (!state.scanning && state.devicesLoaded && !currentDevice() && Backend.inApp);
@@ -866,7 +868,9 @@ function updateScanBar() {
   auto.setAttribute('aria-checked', String(settings.auto));
   auto.hidden = settings.source === 'feeder';
   $('autoDelay').textContent = `${settings.autoDelay} s`;
-  $('scanHint').textContent = settings.auto && settings.source !== 'feeder'
+  $('scanHint').textContent = settings.layout === 'idcard' && settings.source !== 'feeder'
+    ? (idFront ? 'Turn the card over on the glass, then press Space. Esc starts again.' : 'ID card copy: put the card anywhere on the glass and press Space for the front.')
+    : settings.auto && settings.source !== 'feeder'
     ? 'Auto: after each scan, swap the page — the next scan starts by itself. Esc stops.'
     : 'Place the next page and press Space. Crop, straighten and your adjustments apply automatically.';
 }
@@ -936,6 +940,7 @@ async function scan({ replace = null, copy = false } = {}) {
     const bitmap = await createImageBitmap(new Blob([f.bytes]));
     const target = replace && state.pages.includes(replace) && files.length === 1 ? replace : null;
     const layout = target || copy || source === 'feeder' ? 'page' : settings.layout;
+    if (layout === 'idcard') { await idCardScan(bitmap, f.dpi || r.dpi || ps.dpi, presetKey); continue; }
     const pieces = layout === 'page'
       ? [await addBitmap(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, target, d.name)]
       : await addPieces(bitmap, f.dpi || r.dpi || ps.dpi, presetKey, intent !== 'color' && !r.simple, d.name, layout);
@@ -951,6 +956,57 @@ async function scan({ replace = null, copy = false } = {}) {
   if (blank) toast(`Skipped ${blank} blank page${blank === 1 ? '' : 's'}.`);
   if (copy && added.length) { await PrintPanel.quick(added); return; }
   if (!replace && source === 'flatbed' && autoRunning) afterAutoScan(added[0], added.length);
+}
+
+// ---------- ID card copy ----------
+// Scan the front, turn the card over, scan the back: both go on one page, one
+// above the other at their real size, ready to print on A4 with "ID card copy".
+let idFront = null;
+const ID_GAP_MM = 8;
+async function idCard(bitmap, dpi, presetKey) {
+  // The card is the biggest thing on the glass.
+  let parts = [bitmap];
+  try { parts = await Imaging.splitItems(bitmap); } catch {}
+  const big = parts.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a));
+  const page = newPage(big, dpi, presetKey);
+  Imaging.analyse(page);
+  return Imaging.render(page, Infinity);
+}
+async function idCardScan(bitmap, dpi, presetKey) {
+  const card = await idCard(bitmap, dpi, presetKey);
+  if (!idFront) {
+    idFront = { canvas: card, dpi };
+    updateScanBar();
+    toast('Front done. Turn the card over and press Space for the back. Esc starts again.', { sticky: true });
+    return;
+  }
+  const front = idFront.canvas;
+  idFront = null;
+  const gap = Math.round((ID_GAP_MM / 25.4) * dpi);
+  const c = Imaging.makeCanvas(Math.max(front.width, card.width), front.height + gap + card.height);
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(front, Math.round((c.width - front.width) / 2), 0);
+  g.drawImage(card, Math.round((c.width - card.width) / 2), front.height + gap);
+  front.width = front.height = card.width = card.height = 0;
+  const sheet = await createImageBitmap(c);
+  c.width = c.height = 0;
+  const page = addDocumentPage(sheet, dpi, { idCard: true });
+  if (!state.nameEdited) { $('fileName').value = `ID card ${today()}`; renderFolder(); }
+  updateScanBar();
+  toast('ID card ready: front and back on one page at their real size.', {
+    action: 'Print it', duration: 10000,
+    onAction: () => PrintPanel.open({ pages: String(state.pages.indexOf(page) + 1), profile: 'ID card copy' }),
+  });
+}
+function cancelIdCard() {
+  if (!idFront) return false;
+  idFront.canvas.width = idFront.canvas.height = 0;
+  idFront = null;
+  updateScanBar();
+  toast('ID card copy started again: scan the front.');
+  return true;
 }
 
 // ---------- Hands-free: scan again after a countdown ----------
@@ -1040,14 +1096,14 @@ async function importBytes(list) {
 
 // A PDF's pages, rendered by Windows at 200 dpi (150 dpi past 30 pages, at most 150 pages).
 const PDF_MAX_PAGES = 150;
-async function importPdf(path, { label = '' } = {}) {
-  const name = label || fileName(path);
+// The PDF's pages as document pages (not added anywhere yet). null when it couldn't be opened.
+async function pdfToPages(path, name) {
   toast(`Opening ${name}…`, { sticky: true });
   let r;
   try { r = await Backend.pdfPages(path, 200, PDF_MAX_PAGES); }
-  catch (e) { toast(e.error || `Couldn’t open ${name}.`, { bad: true }); return []; }
-  if (r.ok === false) { toast(r.error || `Couldn’t open ${name}.`, { bad: true }); return []; }
-  const added = [];
+  catch (e) { toast(e.error || `Couldn’t open ${name}.`, { bad: true }); return null; }
+  if (r.ok === false) { toast(r.error || `Couldn’t open ${name}.`, { bad: true }); return null; }
+  const pages = [];
   for (let i = 0; i < r.pages.length; i++) {
     const pg = r.pages[i];
     toast(`Opening ${name}: page ${i + 1} of ${r.pages.length}…`, { sticky: true });
@@ -1055,13 +1111,29 @@ async function importPdf(path, { label = '' } = {}) {
       const bitmap = await createImageBitmap(new Blob([await Backend.readFile(pg.path)]));
       // Its real size: dots across ÷ inches across.
       const dpi = Math.max(bitmap.width, bitmap.height) / Math.max(pg.wIn || 0, pg.hIn || 0) || pg.dpi || r.dpi;
-      added.push(addDocumentPage(bitmap, dpi));
+      pages.push(docPage(bitmap, dpi));
     } catch (e) { console.warn('PDF page failed', e); }
     Backend.discard(pg.path);
   }
-  const more = r.count > r.rendered ? ` (the first ${r.rendered} of ${r.count} pages)` : '';
-  if (!added.length) toast(`Couldn’t open ${name}.`, { bad: true });
-  else toast(`Added ${name}: ${added.length} ${added.length === 1 ? 'page' : 'pages'}${more}.`);
+  if (!pages.length) { toast(`Couldn’t open ${name}.`, { bad: true }); return null; }
+  $('toast').hidden = true;
+  return { pages, count: r.count, rendered: pages.length };
+}
+const pdfMore = (r) => (r.count > r.rendered ? ` (the first ${r.rendered} of ${r.count} pages)` : '');
+async function importPdf(path, { label = '' } = {}) {
+  const name = label || fileName(path);
+  const r = await pdfToPages(path, name);
+  if (!r) return [];
+  const added = [];
+  for (const pg of r.pages) {
+    state.pages.push(pg);
+    state.current = state.pages.length - 1;
+    refreshThumb(pg);
+    added.push(pg);
+  }
+  renderThumbs();
+  showPage();
+  toast(`Added ${name}: ${added.length} ${added.length === 1 ? 'page' : 'pages'}${pdfMore(r)}.`);
   return added;
 }
 
@@ -1079,7 +1151,7 @@ async function importPaths(paths, opts = {}) {
   return added;
 }
 $('importBtn').onclick = async () => importPaths(await Backend.pickImages());
-Backend.onFileDrop((paths) => { $('dropVeil').hidden = true; importPaths(paths); });
+Backend.onFileDrop((paths) => { $('dropVeil').hidden = true; if (settings.mode === 'print') Job.addPaths(paths); else importPaths(paths); });
 if (window.__TAURI__ && window.__TAURI__.event) {
   window.__TAURI__.event.listen('tauri://drag-enter', () => { $('dropVeil').hidden = false; });
   window.__TAURI__.event.listen('tauri://drag-leave', () => { $('dropVeil').hidden = true; });
@@ -1091,6 +1163,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     e.preventDefault();
     $('dropVeil').hidden = true;
     const list = [];
+    if (settings.mode === 'print') { Job.addPaths([...e.dataTransfer.files].map((f) => `mock://${f.name}`)); return; }
     for (const f of e.dataTransfer.files) {
       // Preview only: PDFs go through the stand-in renderer.
       if (isPdfName(f.name)) { await importPaths([`mock://${f.name}`]); continue; }
@@ -1112,9 +1185,10 @@ async function suggestName() {
   let n = 1;
   try { n = await Backend.nextNumber(settings.folder, prefix); } catch {}
   $('fileName').value = `${prefix} ${String(n).padStart(3, '0')}`;
+  renderFolder();
   state.nameEdited = false;
 }
-$('fileName').addEventListener('input', () => { state.nameEdited = true; });
+$('fileName').addEventListener('input', () => { state.nameEdited = true; renderFolder(); });
 $('smartName').checked = settings.smartName;
 $('smartName').onchange = (e) => { settings.smartName = e.target.checked; saveSettings(); if (settings.smartName) maybeSmartName(); else if (!state.nameEdited) suggestName(); };
 
@@ -1140,7 +1214,7 @@ async function maybeSmartName() {
     if (state.nameEdited || state.pages[0] !== page) return;
     const name = nameFromWords(words || [], height);
     state.smartFor = page.id;
-    if (name) { $('fileName').value = `${name} ${today()}`; state.smartNamed = true; }
+    if (name) { $('fileName').value = `${name} ${today()}`; state.smartNamed = true; renderFolder(); }
     else if (state.smartNamed) { state.smartNamed = false; await suggestName(); }
   } finally {
     smartBusy = false;
@@ -1212,12 +1286,19 @@ function nameFromWords(words, imageHeight = 0) {
 function renderFormat() {
   for (const b of $('formatSeg').children) b.setAttribute('aria-checked', String(b.dataset.v === settings.format));
   $('searchableRow').hidden = settings.format !== 'pdf';
+  $('sizeRow').hidden = settings.format !== 'pdf';
+  $('sizeLimit').value = String(settings.sizeLimit);
+  $('sortByType').checked = settings.sortByType;
+  $('copyAfterSave').checked = settings.copyAfterSave;
   $('paperRow').hidden = settings.format !== 'pdf';
   $('paper').value = settings.paper;
   $('searchable').checked = settings.searchable;
   updateSaveLabel();
 }
 $('paper').onchange = (e) => { settings.paper = e.target.value; saveSettings(); };
+$('sizeLimit').onchange = (e) => { settings.sizeLimit = Number(e.target.value); saveSettings(); };
+$('sortByType').onchange = (e) => { settings.sortByType = e.target.checked; saveSettings(); renderFolder(); };
+$('copyAfterSave').onchange = (e) => { settings.copyAfterSave = e.target.checked; saveSettings(); };
 $('upright').checked = settings.upright;
 $('upright').onchange = (e) => { settings.upright = e.target.checked; saveSettings(); };
 $('searchable').onchange = (e) => { settings.searchable = e.target.checked; saveSettings(); };
@@ -1263,7 +1344,12 @@ function updateSaveLabel() {
   $('printBtn').disabled = !n || state.saving || state.scanning;
 }
 
-function renderFolder() { $('folderText').textContent = settings.folder; $('folderBtn').title = settings.folder; }
+// Shows where Save will really put the file (with the type folder when sorting is on).
+function renderFolder() {
+  const f = saveFolder(($('fileName') && $('fileName').value) || '');
+  $('folderText').textContent = f;
+  $('folderBtn').title = f;
+}
 $('folderBtn').onclick = async () => {
   const f = await Backend.pickFolder(settings.folder);
   if (f) {
@@ -1275,14 +1361,32 @@ $('folderBtn').onclick = async () => {
 };
 
 const sep = () => (settings.folder.includes('\\') || !settings.folder.includes('/') ? '\\' : '/');
-const joinPath = (name) => settings.folder.replace(/[\\/]+$/, '') + sep() + name;
+const joinPath = (name, folder = settings.folder) => folder.replace(/[\\/]+$/, '') + sep() + name;
+
+// Sort into folders by type: the folder follows the file name you see (e.g. "Invoice 1043…" → Invoices).
+const TYPE_FOLDERS = [
+  [/\b(?:id card|aadhaa?r|pan card|passport|driving licen[cs]e|voter id)\b/i, 'IDs'],
+  [/\bcredit note\b/i, 'Credit notes'], [/\bpurchase order\b/i, 'Purchase orders'],
+  [/\binvoice\b/i, 'Invoices'], [/\bchallan\b/i, 'Challans'], [/\bpayslip\b|\bsalary slip\b/i, 'Payslips'],
+  [/\bquotation\b|\bquote\b/i, 'Quotations'], [/\bestimate\b/i, 'Estimates'], [/\bstatement\b/i, 'Statements'],
+  [/\breceipt\b/i, 'Receipts'], [/\bbill\b|\bcash memo\b/i, 'Bills'], [/\border\b/i, 'Orders'],
+];
+function typeFolder(name) {
+  if (!settings.sortByType) return '';
+  const hit = TYPE_FOLDERS.find(([re]) => re.test(name || ''));
+  return hit ? hit[1] : '';
+}
+function saveFolder(name) {
+  const sub = typeFolder(name);
+  return sub ? joinPath(sub) : settings.folder;
+}
 const cleanName = (s) => s.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/[. ]+$/, '').trim() || `Scan ${today()}`;
 
-async function freeBase(base, ext, multi) {
+async function freeBase(base, ext, multi, folder = settings.folder) {
   for (let k = 1; k < 1000; k++) {
     const b = k === 1 ? base : `${base} (${k})`;
     const probe = multi ? `${b} p01.${ext}` : `${b}.${ext}`;
-    if (!(await Backend.exists(joinPath(probe)))) return b;
+    if (!(await Backend.exists(joinPath(probe, folder)))) return b;
   }
   return `${base} ${Date.now()}`;
 }
@@ -1297,8 +1401,12 @@ async function save(startNew) {
   const pages = state.pages.slice();
   const n = pages.length;
   let firstPath = '';
+  const savedPaths = [];
+  let sizeNote = '';
   try {
-    const base = await freeBase(cleanName($('fileName').value), fmt, fmt !== 'pdf' && n > 1);
+    const wanted = cleanName($('fileName').value);
+    const folder = saveFolder(wanted);
+    const base = await freeBase(wanted, fmt, fmt !== 'pdf' && n > 1, folder);
     if (fmt === 'pdf') {
       const parts = [];
       for (let i = 0; i < n; i++) {
@@ -1323,8 +1431,14 @@ async function save(startNew) {
       }
       toast('Writing PDF…', { sticky: true });
       await nextFrame();
-      const pdf = PdfWriter.build(parts, base);
-      firstPath = await Backend.saveFile(joinPath(`${base}.pdf`), pdf);
+      let pdf = PdfWriter.build(parts, base);
+      if (settings.sizeLimit && pdf.length > settings.sizeLimit * 1000) {
+        const r = await shrinkPdf(pages, parts, base, settings.sizeLimit * 1000);
+        pdf = r.pdf;
+        sizeNote = r.note;
+      }
+      firstPath = await Backend.saveFile(joinPath(`${base}.pdf`, folder), pdf);
+      savedPaths.push(firstPath);
     } else {
       const type = fmt === 'png' ? 'image/png' : 'image/jpeg';
       for (let i = 0; i < n; i++) {
@@ -1334,12 +1448,19 @@ async function save(startNew) {
         const bytes = new Uint8Array(await (await Imaging.toBlob(c, type, 0.92)).arrayBuffer());
         c.width = c.height = 0;
         const name = n > 1 ? `${base} p${String(i + 1).padStart(2, '0')}.${fmt}` : `${base}.${fmt}`;
-        const saved = await Backend.saveFile(joinPath(name), bytes);
+        const saved = await Backend.saveFile(joinPath(name, folder), bytes);
+        savedPaths.push(saved);
         if (!firstPath) firstPath = saved;
       }
     }
-    const where = fmt === 'pdf' ? `${base}.pdf` : (n > 1 ? `${n} ${fmt.toUpperCase()}s` : `${base}.${fmt}`);
-    toast(`Saved ${n} page${n === 1 ? '' : 's'}: ${where}`, { action: 'Show in folder', onAction: () => Backend.reveal(firstPath), duration: 7000 });
+    const sub = typeFolder(wanted);
+    const where = (sub ? `${sub}\\` : '') + (fmt === 'pdf' ? `${base}.pdf` : (n > 1 ? `${n} ${fmt.toUpperCase()}s` : `${base}.${fmt}`));
+    let copied = '';
+    if (settings.copyAfterSave) {
+      try { await Backend.copyFiles(savedPaths); copied = ' Copied: paste it into WhatsApp, an email or a folder (Ctrl+V).'; }
+      catch (e) { copied = ` Couldn’t copy it: ${e.error || 'clipboard busy'}.`; }
+    }
+    toast(`Saved ${n} page${n === 1 ? '' : 's'}: ${where}.${sizeNote}${copied}`, { action: 'Show in folder', onAction: () => Backend.reveal(firstPath), duration: copied ? 10000 : 7000 });
     if (startNew) {
       while (state.pages.length) removePage(0, { undoable: false });
       if (lastRemoved) { dropPage(lastRemoved.page); lastRemoved = null; }
@@ -1355,6 +1476,35 @@ async function save(startNew) {
   }
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
+// Smaller PDF for uploads: lower the picture quality, then the resolution, until it fits.
+// Black-and-white pages stay 1-bit; the text layer is scaled with the pictures.
+const SHRINK_STEPS = [[0.7, 1], [0.55, 1], [0.55, 0.75], [0.45, 0.6], [0.35, 0.5], [0.3, 0.4], [0.25, 0.3]];
+const kb = (n) => `${Math.max(1, Math.round(n / 1000))} KB`;
+async function shrinkPdf(pages, parts, title, limit) {
+  let best = null;
+  for (let a = 0; a < SHRINK_STEPS.length; a++) {
+    const [q, sc] = SHRINK_STEPS[a];
+    const next = [];
+    for (let i = 0; i < pages.length; i++) {
+      toast(`Making the PDF smaller than ${kb(limit)}: try ${a + 1}, page ${i + 1} of ${pages.length}…`, { sticky: true });
+      await nextFrame();
+      const p = parts[i];
+      const c = Imaging.render(pages[i], Math.max(200, Math.round(Math.max(p.width, p.height) * sc)));
+      const k = c.width / p.width;
+      const img = pages[i].adj.mode === 'bw'
+        ? { bits: await PdfWriter.bitsFrom(c) }
+        : { jpeg: new Uint8Array(await (await Imaging.toBlob(c, 'image/jpeg', q)).arrayBuffer()) };
+      const words = p.words ? p.words.map((w) => ({ ...w, x: w.x * k, y: w.y * k, w: w.w * k, h: w.h * k })) : null;
+      next.push({ ...img, width: c.width, height: c.height, dpi: p.dpi * k, words, pageW: p.pageW, pageH: p.pageH });
+      c.width = c.height = 0;
+    }
+    const pdf = PdfWriter.build(next, title);
+    if (!best || pdf.length < best.length) best = pdf;
+    if (pdf.length <= limit) return { pdf, note: ` ${kb(pdf.length)}, under ${kb(limit)}${sc < 1 ? ' (pictures made smaller)' : ''}.` };
+  }
+  return { pdf: best, note: ` Couldn’t get it under ${kb(limit)}: the smallest is ${kb(best.length)}. Fewer pages or B&W helps.` };
+}
 
 // ---------- Printing (print.js) ----------
 $('printBtn').onclick = () => PrintPanel.open();
@@ -1398,16 +1548,23 @@ async function runArgs() {
   argQueue = { add: [], print: [], inbox: false };
   try {
     if (q.add.length) await importPaths(q.add);
-    if (q.print.length) await printFiles(await importPaths(q.print));
+    if (q.print.length) await sendToJob(q.print);
     if (q.inbox) await checkInbox();
   } finally { runningArgs = false; }
 }
-// New pages straight into the print panel, with just those pages picked.
-async function printFiles(pages, from = '') {
-  if (!pages.length) return;
-  const first = state.pages.indexOf(pages[0]) + 1, last = state.pages.indexOf(pages[pages.length - 1]) + 1;
-  if (PrintPanel.isOpen()) PrintPanel.close();
-  await PrintPanel.open({ pages: first === last ? String(first) : `${first}-${last}`, job: pages, from });
+// Files to print (right-click Print with Prisca, the Prisca printer) go to the Print job.
+async function sendToJob(paths, opts = {}) {
+  const before = Job.count();
+  const added = await Job.addPaths(paths, opts);
+  if (!added.length) return;
+  setMode('print');
+  Backend.showWindow();
+  const names = added.length === 1 ? added[0].name : `${added.length} files`;
+  if (before) {
+    toast(`Added ${names} to the print job. It already had ${before} other ${before === 1 ? 'file' : 'files'}, still included.`, {
+      action: 'Print only this', duration: 10000, onAction: () => Job.keepOnly(added),
+    });
+  } else toast(`Ready to print: ${names}.`);
 }
 let inboxBusy = false;
 async function checkInbox() {
@@ -1416,9 +1573,8 @@ async function checkInbox() {
   try {
     const r = await Backend.inboxTake();
     if (r.files && r.files.length) {
-      const pages = [];
-      for (const f of r.files) { pages.push(...await importPdf(f, { label: 'the printed document' })); Backend.discard(f); }
-      if (pages.length) await printFiles(pages, 'printer');
+      await sendToJob(r.files, { label: 'Printed from another app', temporary: true });
+      for (const f of r.files) Backend.discard(f);
     }
     // Windows is still writing a job: look again soon.
     if (r.waiting) setTimeout(checkInbox, 1200);
@@ -1461,9 +1617,82 @@ async function setContextMenu(on, tell = false) {
 }
 Backend.onArgs(handleArgs);
 
+// ---------- Print | Scan ----------
+function setMode(mode) {
+  if (mode !== 'print' && mode !== 'scan') return;
+  if (mode === 'print' && (state.scanning || state.saving)) return;
+  settings.mode = mode;
+  saveSettings();
+  document.body.classList.toggle('mode-print', mode === 'print');
+  for (const b of $('modes').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.v === mode));
+  if (mode === 'print') PrintPanel.openJob();
+  else if (PrintPanel.isJob()) PrintPanel.close();
+}
+$('modes').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setMode(b.dataset.v); });
+
+// ---------- Settings menu: Prisca with the rest of Windows ----------
+function openSettingsMenu() {
+  const m = $('settingsMenu');
+  if (!m.hidden) { m.hidden = true; return; }
+  m.innerHTML = '';
+  const item = (text, title, on, fn) => {
+    const b = document.createElement('button');
+    if (on !== null) { b.setAttribute('role', 'menuitemcheckbox'); b.setAttribute('aria-checked', String(on)); }
+    b.innerHTML = `<span class="tick">${on ? '✓' : ''}</span><span></span>`;
+    b.lastChild.textContent = text;
+    b.title = title;
+    b.onclick = () => { m.hidden = true; fn(); };
+    m.appendChild(b);
+  };
+  item(priscaPrinter.printer ? 'Remove the Prisca printer…' : 'Add Prisca as a printer…',
+    priscaPrinter.printer ? 'Other apps will no longer list Prisca as a printer' : 'So any app (Chrome, Google Drive, Word…) can print to Prisca, with your margins and settings. Windows asks for permission once.',
+    null, () => setupPriscaPrinter(priscaPrinter.printer ? 'remove' : 'add'));
+  item('Show Prisca in the right-click menu', 'Print with Prisca and Open in Prisca on PDFs and pictures (Windows 11: under Show more options)', settings.contextMenu, () => setContextMenu(!settings.contextMenu, true));
+  item('Keep Prisca in the tray when closed', 'Closing the window leaves Prisca running in the tray, ready for print jobs and Ctrl+Alt+S', settings.tray, () => setTray(!settings.tray, true));
+  item('Start with Windows (in the tray)', 'Prisca starts hidden in the tray when you sign in', autostartOn, () => setAutostart(!autostartOn));
+  item('Scan from anywhere: Ctrl+Alt+S', 'Brings Prisca forward and scans, from any app. Only this key combination is taken.', settings.hotkey, () => setHotkey(!settings.hotkey, true));
+  m.hidden = false;
+}
+$('settingsBtn').onclick = (e) => { e.stopPropagation(); $('deviceMenu').hidden = true; openSettingsMenu(); };
+document.addEventListener('click', (e) => { if (!$('settingsMenu').contains(e.target)) $('settingsMenu').hidden = true; });
+
+let autostartOn = false;
+async function setTray(on, tell = false) {
+  settings.tray = on;
+  saveSettings();
+  await Backend.setKeepInTray(on);
+  if (tell) toast(on ? 'Closing the window now keeps Prisca in the tray. Quit from the tray icon.' : 'Closing the window now quits Prisca.');
+}
+async function setAutostart(on) {
+  try {
+    autostartOn = await Backend.setAutostart(on);
+    if (on && autostartOn && !settings.tray) await setTray(true);
+    toast(autostartOn ? 'Prisca will start in the tray when you sign in to Windows.' : 'Prisca won’t start with Windows.');
+  } catch (e) { toast(e.error || 'Couldn’t change starting with Windows.', { bad: true }); }
+}
+async function setHotkey(on, tell = false) {
+  try {
+    await Backend.setScanHotkey(on);
+    settings.hotkey = on;
+    saveSettings();
+    if (tell) toast(on ? 'Ctrl+Alt+S now scans from any app (while Prisca is running).' : 'Ctrl+Alt+S is free again.');
+  } catch (e) {
+    settings.hotkey = false;
+    saveSettings();
+    toast(e.error || 'Couldn’t set Ctrl+Alt+S.', { bad: true });
+  }
+}
+// Ctrl+Alt+S or the tray's Scan now: switch to Scan and scan.
+Backend.onScanKey(() => {
+  if (settings.mode !== 'scan') setMode('scan');
+  if (!state.scanning && !state.saving) scanFromUser();
+});
+
 // ---------- Keyboard ----------
 const isTyping = (el) => el && (el.tagName === 'INPUT' && el.type === 'text');
 window.addEventListener('keydown', (e) => {
+  // Ctrl+1 Print, Ctrl+2 Scan (Pri + Sca).
+  if ((e.ctrlKey || e.metaKey) && (e.key === '1' || e.key === '2')) { e.preventDefault(); setMode(e.key === '1' ? 'print' : 'scan'); return; }
   if (PrintPanel.isOpen()) { PrintPanel.key(e); return; }
   const typing = isTyping(document.activeElement);
   const k = e.key;
@@ -1492,6 +1721,7 @@ window.addEventListener('keydown', (e) => {
   }
   if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'z') { e.preventDefault(); undoRemove(); return; }
   if (k === 'Escape') {
+    cancelIdCard();
     if (autoTimer || autoRunning) { autoRunning = false; stopAuto(); }
     if (state.scanning) cancelScan();
     else if (state.cropping) finishCrop();
@@ -1517,7 +1747,8 @@ document.addEventListener('pointerup', (e) => {
 window.addEventListener('contextmenu', (e) => { if (!isTyping(e.target)) e.preventDefault(); });
 
 // ---------- Start ----------
-(async function init() {
+// After every script (print.js, job.js) has loaded.
+window.addEventListener('DOMContentLoaded', async function init() {
   if (!settings.folder) {
     try { settings.folder = await Backend.defaultFolder(); } catch { settings.folder = ''; }
     saveSettings();
@@ -1532,10 +1763,14 @@ window.addEventListener('contextmenu', (e) => { if (!isTyping(e.target)) e.preve
   // Keep the right-click menu pointing at this copy of Prisca (it moves when updated or reinstalled).
   if (settings.contextMenu && Backend.inApp) setContextMenu(true);
   loadPriscaPrinter().then(() => { if (priscaPrinter.printer) checkInbox(); });
+  Backend.setKeepInTray(settings.tray);
+  if (settings.hotkey) setHotkey(true);
+  Backend.autostartState().then((on) => { autostartOn = !!on; });
+  setMode(settings.mode);
   const args = await Backend.startupArgs();
   if (args && args.length) handleArgs(args);
   setTimeout(checkForUpdate, 4000);
-})();
+});
 
 // ---------- Updates ----------
 async function checkForUpdate() {

@@ -14,20 +14,25 @@
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f2b544" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"></path><path d="M20 8V5.5A1.5 1.5 0 0 0 18.5 4H16"></path><path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20H8"></path><path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"></path><path d="M3 12h18"></path></svg>
       <span>Prisca</span>
     </div>
-    <div class="presets" id="presets" role="radiogroup" aria-label="Scan preset"></div>
-    <label class="mini-select" title="Scan resolution">
+    <div class="modes" id="modes" role="group" aria-label="Print or scan">
+      <button data-v="print" title="Print files (Ctrl+1)">Print</button>
+      <button data-v="scan" title="Scan (Ctrl+2)">Scan</button>
+    </div>
+    <div class="presets scan-only" id="presets" role="radiogroup" aria-label="Scan preset"></div>
+    <label class="mini-select scan-only" title="Scan resolution">
       <span class="sr">Resolution</span>
       <select id="dpi"></select>
     </label>
-    <label class="mini-select" title="What's on the glass: one page, several items (receipts, cards, photos) or an open book">
+    <label class="mini-select scan-only" title="What's on the glass: one page, several items (receipts, cards, photos) or an open book">
       <span class="sr">Layout</span>
       <select id="layout">
         <option value="page">One page</option>
         <option value="items">Several items</option>
         <option value="book">Book: 2 pages</option>
+        <option value="idcard">ID card: front + back</option>
       </select>
     </label>
-    <label class="mini-select" id="sourceWrap" hidden title="Where the paper is">
+    <label class="mini-select scan-only" id="sourceWrap" hidden title="Where the paper is">
       <span class="sr">Source</span>
       <select id="source">
         <option value="flatbed">Glass</option>
@@ -41,6 +46,10 @@
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
     </button>
     <div class="menu" id="deviceMenu" hidden role="listbox"></div>
+    <button class="icon-btn settings-btn" id="settingsBtn" aria-label="Settings" title="Prisca and Windows: printer, right-click menu, tray, start with Windows, Ctrl+Alt+S">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path></svg>
+    </button>
+    <div class="menu settings-menu" id="settingsMenu" hidden role="menu"></div>
   </header>
 
   <main class="body">
@@ -176,9 +185,25 @@
               <option value="actual">As scanned</option>
             </select>
           </label>
+          <label class="field inline" id="sizeRow" title="For upload forms with a size limit: Prisca lowers picture quality, then resolution, until the PDF fits">Size limit
+            <select id="sizeLimit">
+              <option value="0">None</option>
+              <option value="200">Under 200 KB</option>
+              <option value="500">Under 500 KB</option>
+              <option value="1000">Under 1 MB</option>
+            </select>
+          </label>
           <label class="check" id="searchableRow" title="Uses Windows' own text recognition">
             <input type="checkbox" id="searchable">
             <span>Searchable PDF <small>text you can find and copy</small></span>
+          </label>
+          <label class="check" title="The folder follows the file name: “Invoice 1043…” goes to Invoices, “ID card…” to IDs">
+            <input type="checkbox" id="sortByType">
+            <span>Sort into folders by type <small>Bills, Invoices, Receipts, IDs…</small></span>
+          </label>
+          <label class="check" title="Puts the saved file on the clipboard">
+            <input type="checkbox" id="copyAfterSave">
+            <span>Copy the file after saving <small>paste it into WhatsApp, an email or a folder</small></span>
           </label>
           <button class="folder" id="folderBtn" title="Change folder">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z"></path></svg>
@@ -202,10 +227,21 @@
   </main>
 
   <section class="print-panel" id="printPanel" hidden aria-label="Print">
+    <aside class="pr-job" id="prJob">
+      <div class="job-head"><span class="pr-label">Print job</span><span class="mono" id="jobLine"></span></div>
+      <div class="seg job-tabs" id="jobTabs"><button data-v="job">This job</button><button data-v="history">Print again</button></div>
+      <div class="job-list scroll" id="jobList"></div>
+      <div class="job-list scroll" id="jobHistory" hidden></div>
+      <div class="job-foot" id="jobFoot">
+        <div class="btn-row"><button class="ghost" id="jobAdd" title="PDFs and pictures (you can pick several)">+ Add files</button><button class="ghost" id="jobScans" title="The pages in Scan">+ Scans</button></div>
+        <div class="job-recents" id="jobRecentFiles"></div>
+        <div class="btn-row"><button class="ghost" id="jobClear">Clear</button><button class="ghost grow" id="jobSavePdf" title="The picked pages, in this order, as one PDF in your Prisca folder">Save as one PDF</button></div>
+      </div>
+    </aside>
     <div class="pr-preview">
       <div class="pr-legend">
         <span><i class="lg-margin"></i>Your margins</span>
-        <span><i class="lg-hard"></i>Printer can’t reach</span>
+        <span title="The edge this printer can’t print on"><i class="lg-hard"></i>Can’t print</span>
         <span><i class="lg-anchor"></i>Anchor</span>
         <span class="spacer"></span>
         <span class="mono" id="prPaperLine"></span>
@@ -235,6 +271,7 @@
             <button type="button" class="ghost" id="prProfileCancel">Cancel</button>
           </form>
           <p class="pr-note" id="prPrinterState"></p>
+          <div class="pr-queue" id="prQueue"></div>
         </section>
 
         <section class="pr-group">
@@ -285,11 +322,16 @@
           </div>
         </section>
 
+        <section class="pr-group" id="prBreakRow" hidden>
+          <span class="pr-label">Each file starts</span>
+          <div class="seg" id="prBreak"><button data-v="new" title="Files never share a sheet, so you can hand them out separately">On a new sheet</button><button data-v="flow" title="Pages run on from one file to the next: fewest sheets">Right after</button></div>
+        </section>
+
         <section class="pr-group pr-two">
           <div class="pr-field">Pages per sheet<div class="seg" id="prNup"><button data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button></div></div>
           <div class="pr-field">Ink<div class="seg" id="prInk"><button data-v="colour">Colour</button><button data-v="grey">Grey</button><button data-v="draft" title="Grey and lighter, to save ink">Draft</button></div></div>
           <label class="pr-field">Copies<input type="number" id="prCopies" min="1" max="99" class="pr-input"></label>
-          <label class="pr-field">Pages<input type="text" id="prPages" class="pr-input" placeholder="All, or 1-3, 5"></label>
+          <label class="pr-field" id="prPagesField">Pages<input type="text" id="prPages" class="pr-input" placeholder="All, or 1-3, 5"></label>
         </section>
 
         <section class="pr-group">
@@ -324,5 +366,6 @@
 <script src="pdf.js"></script>
 <script src="app.js"></script>
 <script src="print.js"></script>
+<script src="job.js"></script>
 </body>
 </html>
