@@ -41,6 +41,8 @@ function loadSettings() {
     sizeLimit: [0, 200, 500, 1000].includes(s.sizeLimit) ? s.sizeLimit : 0,
     sortByType: !!s.sortByType,
     copyAfterSave: !!s.copyAfterSave,
+    showAdjust: !!s.showAdjust,
+    thumbCols: [1, 2, 3].includes(s.thumbCols) ? s.thumbCols : 2,
     tray: !!s.tray,
     hotkey: !!s.hotkey,
     recentFiles: Array.isArray(s.recentFiles) ? s.recentFiles.filter((x) => typeof x === 'string').slice(0, 8) : [],
@@ -62,6 +64,7 @@ const state = {
   saving: false,
   cropping: false,
   nameEdited: false,
+  picked: new Set(), // page ids picked with Ctrl/Shift-click
 };
 let pageSeq = 0;
 const cur = () => state.pages[state.current] || null;
@@ -90,14 +93,30 @@ $('dpi').onchange = (e) => {
   renderPresets();
 };
 $('source').onchange = (e) => { settings.source = e.target.value; saveSettings(); updateScanBar(); };
-$('layout').value = settings.layout;
-$('layout').onchange = (e) => {
-  settings.layout = e.target.value;
+// What's on the glass: one page, several items, a book, an ID card.
+const LAYOUT_NOTES = { page: '', items: 'Leave gaps between items', book: 'Gutter in the middle', idcard: 'Card anywhere on the glass' };
+function renderLayout() {
+  for (const b of $('layout').querySelectorAll('button')) b.setAttribute('aria-checked', String(b.dataset.v === settings.layout));
+  $('layoutNote').textContent = LAYOUT_NOTES[settings.layout] || '';
+}
+function setLayout(v) {
+  settings.layout = v;
   saveSettings();
+  renderLayout();
   if (settings.layout !== 'idcard') cancelIdCard();
   updateScanBar();
   if (settings.layout === 'idcard') toast('ID card copy: scan the front, turn the card over, scan the back. Both land on one page at their real size.', { duration: 7000 });
-};
+}
+$('layout').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setLayout(b.dataset.v); });
+renderLayout();
+
+// Adjustments fold away until you want them.
+function renderAdjust() {
+  $('adjustBox').hidden = !settings.showAdjust;
+  $('adjustToggle').textContent = settings.showAdjust ? 'Hide adjustments' : 'Adjust';
+}
+$('adjustToggle').onclick = () => { settings.showAdjust = !settings.showAdjust; saveSettings(); renderAdjust(); };
+renderAdjust();
 
 function currentDevice() {
   return state.devices.find((d) => d.id === settings.deviceId) || state.devices[0] || null;
@@ -269,6 +288,7 @@ function newPage(bitmap, dpi, presetKey) {
     crop: { x: 0, y: 0, w: 1, h: 1 },
     levels: null,
     adj: { ...p.adj },
+    adj0: { ...p.adj },
     thumbUrl: '',
   };
 }
@@ -284,6 +304,8 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
   const at = replace ? state.pages.indexOf(replace) : -1;
   if (at >= 0) {
     page.adj = { ...replace.adj };
+    page.adj0 = { ...(replace.adj0 || replace.adj) };
+    page.userRotated = replace.userRotated;
     page.rot = replace.rot;
     if (page.rot) { page.crop = Imaging.detectCrop(page.bitmap, page.rot, page.skew); Imaging.refreshLevels(page); }
     state.pages[at] = page;
@@ -293,6 +315,8 @@ async function addBitmap(bitmap, dpi, presetKey, scannedGrey, replace = null, de
     state.pages.push(page);
     state.current = state.pages.length - 1;
   }
+  page.print = pagePrint(page.bitmap);
+  if (at < 0) checkDuplicate(page);
   renderThumbs();
   refreshThumb(page);
   showPage();
@@ -307,6 +331,7 @@ function docPage(bitmap, dpi, extra = {}) {
   page.kind = 'doc';
   page.document = true;
   page.adj = { mode: 'color', auto: false, brightness: 0, contrast: 0, sharpness: 0, threshold: 50 };
+  page.adj0 = { ...page.adj };
   page.uprightDone = true;
   return Object.assign(page, extra);
 }
@@ -379,6 +404,7 @@ async function splitCurrent() {
   for (let i = 0; i < parts.length; i++) {
     const page = newPage(parts[i], p.dpi, p.preset);
     page.adj = { ...p.adj };
+    page.adj0 = { ...(p.adj0 || p.adj) };
     page.deviceCast = p.deviceCast;
     page.scannedGrey = p.scannedGrey;
     Imaging.analyse(page);
@@ -420,6 +446,7 @@ function selectPage(i) {
   if (i < 0 || i >= state.pages.length) return;
   if (state.cropping) finishCrop();
   state.current = i;
+  state.picked.clear();
   renderThumbs();
   showPage();
   const el = $('thumbs').children[i];
@@ -431,7 +458,7 @@ function removePage(i, { undoable = true } = {}) {
   const p = state.pages[i];
   if (!p) return;
   if (state.cropping) finishCrop();
-  if (lastRemoved && lastRemoved.page !== p) dropPage(lastRemoved.page);
+  if (lastRemoved) for (const r of [].concat(lastRemoved.many || [lastRemoved])) if (r.page !== p) dropPage(r.page);
   lastRemoved = null;
   if (undoable) {
     lastRemoved = { page: p, index: i };
@@ -453,21 +480,59 @@ function dropPage(p) {
 
 function undoRemove() {
   if (!lastRemoved) return;
-  const { page, index } = lastRemoved;
+  const list = lastRemoved.many || [lastRemoved];
   lastRemoved = null;
-  state.pages.splice(Math.min(index, state.pages.length), 0, page);
-  state.current = state.pages.indexOf(page);
+  for (const { page, index } of list) state.pages.splice(Math.min(index, state.pages.length), 0, page);
+  state.current = state.pages.indexOf(list[0].page);
   renderThumbs();
   showPage();
   $('toast').hidden = true;
 }
 
+const ICONS = {
+  turnL: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>',
+  turnR: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>',
+  crop: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M2 6h14a2 2 0 0 1 2 2v14"/></svg>',
+  turned: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>',
+  adjusted: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>',
+};
+
+// What you've changed on a page yourself, for the small marks on its thumbnail.
+function pageMarks(p) {
+  const marks = [];
+  const a = p.adj, b = p.adj0 || a;
+  // Colour only when you changed it from what the page started as.
+  if (a.mode !== b.mode) marks.push(['text', { bw: 'B&W', grey: 'Grey', color: 'Colour' }[a.mode], `You made it ${{ bw: 'black and white', grey: 'greyscale', color: 'colour' }[a.mode]}`]);
+  if (p.userCropped) marks.push(['crop', '', 'You cropped or straightened it']);
+  if (p.userRotated) marks.push(['turned', '', 'You turned it']);
+  if (a.brightness !== b.brightness || a.contrast !== b.contrast || a.sharpness !== b.sharpness || (a.mode === 'bw' && a.threshold !== b.threshold)) marks.push(['adjusted', '', 'You adjusted brightness, contrast or sharpness']);
+  return marks;
+}
+function fillMarks(box, p) {
+  box.innerHTML = '';
+  for (const [kind, text, title] of pageMarks(p)) {
+    const m = document.createElement('span');
+    m.className = 'mark' + (kind === 'text' ? ' text' : '');
+    m.title = title;
+    if (kind === 'text') m.textContent = text; else m.innerHTML = ICONS[kind];
+    box.appendChild(m);
+  }
+}
+function dupLabel(p) {
+  if (!p.dupOf) return '';
+  const j = state.pages.findIndex((q) => q.id === p.dupOf);
+  return j >= 0 && j !== state.pages.indexOf(p) ? `Same as ${j + 1}?` : '';
+}
+
 function renderThumbs() {
   const wrap = $('thumbs');
   wrap.innerHTML = '';
+  wrap.dataset.cols = String(settings.thumbCols);
+  const ids = new Set(state.pages.map((p) => p.id));
+  for (const id of [...state.picked]) if (!ids.has(id)) state.picked.delete(id);
   state.pages.forEach((p, i) => {
     const b = document.createElement('div');
-    b.className = 'thumb';
+    b.className = 'thumb' + (state.picked.has(p.id) ? ' picked' : '');
     b.tabIndex = 0;
     b.setAttribute('role', 'button');
     b.setAttribute('aria-label', `Page ${i + 1}`);
@@ -477,42 +542,187 @@ function renderThumbs() {
     img.alt = '';
     img.draggable = false;
     if (p.thumbUrl) img.src = p.thumbUrl;
+    const foot = document.createElement('div');
+    foot.className = 'thumb-foot';
     const num = document.createElement('span');
     num.className = 'num';
-    num.textContent = String(i + 1).padStart(2, '0');
+    num.textContent = String(i + 1);
+    const marks = document.createElement('span');
+    marks.className = 'marks';
+    fillMarks(marks, p);
+    foot.append(num, marks);
+    const turns = document.createElement('div');
+    turns.className = 'turns';
+    for (const [dir, label] of [[-1, 'Turn left'], [1, 'Turn right']]) {
+      const t = document.createElement('button');
+      t.className = 'turn';
+      t.title = label;
+      t.setAttribute('aria-label', `${label}: page ${i + 1}`);
+      t.innerHTML = dir < 0 ? ICONS.turnL : ICONS.turnR;
+      t.onclick = (e) => { e.stopPropagation(); p.userRotated = true; rotatePage(p, dir); };
+      turns.appendChild(t);
+    }
     const x = document.createElement('button');
     x.className = 'x';
     x.setAttribute('aria-label', `Remove page ${i + 1}`);
     x.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>';
     x.onclick = (e) => { e.stopPropagation(); removePage(i); };
-    b.append(img, num, x);
+    b.append(img, foot, turns, x);
+    const dup = dupLabel(p);
+    if (dup) {
+      const d = document.createElement('span');
+      d.className = 'dup';
+      d.textContent = dup;
+      d.title = 'Looks like a second scan of the same page. Remove it if it is.';
+      b.appendChild(d);
+    }
     b.addEventListener('pointerdown', (e) => thumbPointerDown(e, i));
     b.addEventListener('keydown', (e) => { if (e.key === 'Enter') selectPage(i); });
     wrap.appendChild(b);
   });
   const slot = document.createElement('div');
   slot.className = 'slot' + (state.scanning ? ' busy' : '');
-  slot.textContent = state.scanning ? 'Scanning…' : 'Next scan lands here';
+  slot.textContent = state.scanning ? 'Scanning…' : '+ Next scan lands here';
   wrap.appendChild(slot);
-  $('pageCount').textContent = `${state.pages.length} page${state.pages.length === 1 ? '' : 's'}`;
+  updateBatchInfo();
+  renderPicked();
   updateScanBar();
   updateSaveLabel();
 }
 
+// ---------- Batch size: what the saved file will roughly weigh ----------
+function pageBytes(p) {
+  const r = p.prepared;
+  if (r && r.key === prepKey(p)) return r.jpeg ? r.jpeg.length : r.bits.length;
+  // Not made yet: a typical figure for a scanned page at this size.
+  const T = Imaging.turnedSize(p.bitmap, p.rot);
+  const px = T.w * p.crop.w * T.h * p.crop.h;
+  return p.adj.mode === 'bw' ? px / 80 : px * (p.adj.mode === 'grey' ? 0.09 : 0.14);
+}
+const mb = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
+function updateBatchInfo() {
+  const n = state.pages.length;
+  const count = `${n} page${n === 1 ? '' : 's'}`;
+  $('batchTip').hidden = n < 2;
+  if (!n) { $('pageCount').textContent = count; $('pageCount').title = ''; return; }
+  let bytes = state.pages.reduce((t, p) => t + pageBytes(p), 0);
+  if (settings.format === 'png') bytes *= 5; // PNG keeps every pixel: several times a JPEG
+  const fmt = settings.format.toUpperCase();
+  const limit = settings.format === 'pdf' && settings.sizeLimit && bytes > settings.sizeLimit * 1000;
+  $('pageCount').textContent = `${count} · ≈${mb(bytes)}${limit ? ` → ${mb(settings.sizeLimit * 1000)}` : ''}`;
+  $('pageCount').title = limit
+    ? `About ${mb(bytes)} as ${fmt}; Save shrinks it to fit your ${mb(settings.sizeLimit * 1000)} limit.`
+    : `About ${mb(bytes)} as ${fmt}${settings.format === 'pdf' ? '' : n > 1 ? ' files in all' : ''}. A rough figure until the pages are ready.`;
+}
+
+// ---------- Picking several pages (Ctrl/Shift-click) ----------
+function pickedPages() { return state.pages.filter((p) => state.picked.has(p.id)); }
+function renderPicked() {
+  const n = state.picked.size;
+  $('selBar').hidden = n < 2;
+  $('batchFoot').hidden = n >= 2;
+  $('selCount').textContent = `${n} picked`;
+}
+function pickClick(e, i) {
+  const p = state.pages[i];
+  if (!state.picked.size && cur()) state.picked.add(cur().id);
+  if (e.shiftKey && state.current >= 0) {
+    const [a, b] = [Math.min(state.current, i), Math.max(state.current, i)];
+    if (!(e.ctrlKey || e.metaKey)) state.picked.clear();
+    for (let k = a; k <= b; k++) state.picked.add(state.pages[k].id);
+  } else if (state.picked.has(p.id) && state.picked.size > 1) {
+    state.picked.delete(p.id);
+  } else state.picked.add(p.id);
+  if (state.picked.has(p.id) && !e.shiftKey) state.current = i;
+  if (!state.picked.has(cur() && cur().id)) {
+    const first = state.pages.findIndex((q) => state.picked.has(q.id));
+    if (first >= 0) state.current = first;
+  }
+  renderThumbs();
+  showPage();
+}
+function clearPicked() { state.picked.clear(); renderThumbs(); }
+function turnPicked(dir) { for (const p of pickedPages()) { p.userRotated = true; rotatePage(p, dir); } }
+function removePicked() {
+  const list = pickedPages();
+  if (!list.length) return;
+  if (state.cropping) finishCrop();
+  if (lastRemoved) for (const r of [].concat(lastRemoved.many || [lastRemoved])) dropPage(r.page);
+  const many = list.map((page) => ({ page, index: state.pages.indexOf(page) }));
+  lastRemoved = { many };
+  state.pages = state.pages.filter((p) => !state.picked.has(p.id));
+  state.picked.clear();
+  state.current = Math.min(Math.max(0, many[0].index), state.pages.length - 1);
+  toast(`${many.length} pages removed.`, { action: 'Undo', onAction: undoRemove });
+  renderThumbs();
+  showPage();
+}
+$('selTurnL').onclick = () => turnPicked(-1);
+$('selTurnR').onclick = () => turnPicked(1);
+$('selRemove').onclick = removePicked;
+$('selPrint').onclick = () => { Job.addScans(pickedPages()); clearPicked(); setMode('print'); };
+$('selClear').onclick = clearPicked;
+
+// ---------- Thumbnail size: Ctrl + scroll over the batch ----------
+$('thumbs').addEventListener('wheel', (e) => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  const c = Math.min(3, Math.max(1, settings.thumbCols + (e.deltaY > 0 ? 1 : -1)));
+  if (c === settings.thumbCols) return;
+  settings.thumbCols = c;
+  saveSettings();
+  $('thumbs').dataset.cols = String(c);
+}, { passive: false });
+
+// ---------- Same page scanned twice ----------
+// A small grey fingerprint of the scan (48×48). Scanning the same sheet twice
+// without moving it gives almost the same numbers; a different page doesn't.
+function pagePrint(bitmap) {
+  try {
+    const N = 48, c = document.createElement('canvas');
+    c.width = c.height = N;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bitmap, 0, 0, N, N);
+    const d = g.getImageData(0, 0, N, N).data, out = new Uint8Array(N * N);
+    for (let i = 0; i < N * N; i++) out[i] = (d[i * 4] * 3 + d[i * 4 + 1] * 6 + d[i * 4 + 2]) / 10;
+    return out;
+  } catch { return null; }
+}
+function printDiff(a, b) {
+  let t = 0;
+  for (let i = 0; i < a.length; i++) t += Math.abs(a[i] - b[i]);
+  return t / a.length;
+}
+function checkDuplicate(page) {
+  if (!page.print) return;
+  let best = null, bestD = Infinity;
+  for (const q of state.pages) {
+    if (q === page || !q.print || q.document) continue;
+    const d = printDiff(page.print, q.print);
+    if (d < bestD) { bestD = d; best = q; }
+  }
+  if (!best || bestD > 2.5) return;
+  page.dupOf = best.id;
+  const i = state.pages.indexOf(page), j = state.pages.indexOf(best);
+  toast(`Page ${i + 1} looks the same as page ${j + 1}. Scanned twice?`, { action: 'Remove it', onAction: () => { const k = state.pages.indexOf(page); if (k >= 0) removePage(k); }, duration: 7000 });
+}
+
 // Drag a thumbnail to reorder (pointer events: HTML drag and drop is off in the app window).
 function thumbPointerDown(e, from) {
-  if (e.button !== 0 || e.target.closest('.x')) return;
-  const startY = e.clientY;
+  if (e.button !== 0 || e.target.closest('.x, .turn')) return;
+  if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); pickClick(e, from); return; }
+  const startX = e.clientX, startY = e.clientY;
   let dragging = false, target = from;
   const thumbs = () => [...$('thumbs').querySelectorAll('.thumb')];
   const move = (ev) => {
-    if (!dragging && Math.abs(ev.clientY - startY) > 6) { dragging = true; thumbs()[from].classList.add('dragging'); }
+    if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 6) { dragging = true; thumbs()[from].classList.add('dragging'); }
     if (!dragging) return;
     const els = thumbs();
     target = els.length;
+    // Thumbnails sit in rows: the drop goes before the first one past the pointer.
     for (let i = 0; i < els.length; i++) {
       const r = els[i].getBoundingClientRect();
-      if (ev.clientY < r.top + r.height / 2) { target = i; break; }
+      if (ev.clientY < r.top || (ev.clientY <= r.bottom && ev.clientX < r.left + r.width / 2)) { target = i; break; }
     }
     els.forEach((el, i) => el.classList.toggle('drop-before', i === target && target !== from && target !== from + 1));
   };
@@ -556,7 +766,7 @@ async function prepare(page) {
   const ready = { key, ...img, width: c.width, height: c.height, words, ocrTried: settings.searchable };
   c.width = c.height = 0;
   // Only keep it if nothing changed meanwhile.
-  if (prepKey(page) === key) page.prepared = ready;
+  if (prepKey(page) === key) { page.prepared = ready; updateBatchInfo(); }
   if (page === state.pages[0]) maybeSmartName();
 }
 
@@ -579,7 +789,8 @@ function refreshThumb(page, delay = 0) {
     page.thumbUrl = URL.createObjectURL(blob);
     const i = state.pages.indexOf(page);
     const el = $('thumbs').children[i];
-    if (el) el.querySelector('img').src = page.thumbUrl;
+    if (el) { el.querySelector('img').src = page.thumbUrl; fillMarks(el.querySelector('.marks'), page); }
+    updateBatchInfo();
   }, delay));
 }
 
@@ -593,6 +804,9 @@ function showPage() {
   $('empty').hidden = !!p;
   $('canvasWrap').hidden = !p;
   for (const id of ['rotL', 'rotR', 'cropBtn', 'deletePage', 'rescanBtn', 'splitBtn']) $(id).disabled = !p;
+  $('toolbar').hidden = !p;
+  $('pageTag').hidden = !p;
+  if (p) $('pageNum').textContent = `Page ${state.current + 1} of ${state.pages.length}`;
   document.querySelector('.panel').classList.toggle('disabled', !p);
   syncPanel();
   updateMeta();
@@ -606,7 +820,8 @@ function updateMeta() {
   const w = Math.round(T.w * p.crop.w), h = Math.round(T.h * p.crop.h);
   const skew = Math.abs(p.skew) >= 0.05 ? ` · straightened ${Math.abs(p.skew).toFixed(1)}°` : '';
   const took = (p.autoTurned ? ' · turned upright' : '') + (p.scanMs ? ` · scanned in ${(p.scanMs / 1000).toFixed(1)} s` : '');
-  $('pageMeta').textContent = `Page ${state.current + 1} · ${w}×${h} · ${p.dpi} dpi${skew}${took}`;
+  $('pageNum').textContent = `Page ${state.current + 1} of ${state.pages.length}`;
+  $('pageMeta').textContent = `${w}×${h} · ${Math.round(p.dpi)} dpi${skew}${took}`;
 }
 
 function scheduleRender() {
@@ -618,7 +833,7 @@ function scheduleRender() {
 function drawView() {
   const p = cur();
   if (!p) return;
-  const box = $('viewer').getBoundingClientRect();
+  const box = $('pageArea').getBoundingClientRect();
   const availW = Math.max(100, box.width - 64), availH = Math.max(100, box.height - 64);
   const T = Imaging.turnedSize(p.bitmap, p.rot);
   const crop = state.cropping ? { x: 0, y: 0, w: 1, h: 1 } : p.crop;
@@ -660,8 +875,9 @@ function placeCropBox() {
 function startCrop() {
   if (!cur()) return;
   state.cropping = true;
+  state.cropBefore = JSON.stringify([cur().crop, cur().skew]);
   $('cropTools').hidden = false;
-  $('cropBtn').hidden = true;
+  $('pageToolsMain').hidden = true;
   $('skew').value = String(cur().skew);
   $('skewVal').textContent = `${cur().skew.toFixed(1)}°`;
   scheduleRender();
@@ -671,12 +887,14 @@ function finishCrop() {
   const p = cur();
   state.cropping = false;
   $('cropTools').hidden = true;
-  $('cropBtn').hidden = false;
+  $('pageToolsMain').hidden = false;
   if (p) {
+    if (state.cropBefore && state.cropBefore !== JSON.stringify([p.crop, p.skew])) p.userCropped = true;
     Imaging.refreshLevels(p);
     refreshThumb(p);
     updateMeta();
   }
+  state.cropBefore = null;
   scheduleRender();
 }
 
@@ -1328,7 +1546,7 @@ function renderFormat() {
   updateSaveLabel();
 }
 $('paper').onchange = (e) => { settings.paper = e.target.value; saveSettings(); };
-$('sizeLimit').onchange = (e) => { settings.sizeLimit = Number(e.target.value); saveSettings(); };
+$('sizeLimit').onchange = (e) => { settings.sizeLimit = Number(e.target.value); saveSettings(); updateBatchInfo(); };
 $('sortByType').onchange = (e) => { settings.sortByType = e.target.checked; saveSettings(); renderFolder(); };
 $('copyAfterSave').onchange = (e) => { settings.copyAfterSave = e.target.checked; saveSettings(); };
 $('upright').checked = settings.upright;
@@ -1365,7 +1583,7 @@ async function recognise(canvas, quiet = false) {
   });
   return words;
 }
-for (const b of $('formatSeg').children) b.onclick = () => { settings.format = b.dataset.v; saveSettings(); renderFormat(); };
+for (const b of $('formatSeg').children) b.onclick = () => { settings.format = b.dataset.v; saveSettings(); renderFormat(); updateBatchInfo(); };
 
 function updateSaveLabel() {
   const n = state.pages.length;
@@ -1540,6 +1758,12 @@ async function shrinkPdf(pages, parts, title, limit) {
 
 // ---------- Printing (print.js) ----------
 $('printBtn').onclick = () => PrintPanel.open();
+// The batch into the print job, alongside any PDFs there.
+$('batchPrintBtn').onclick = () => {
+  if (!state.pages.length) { toast('Scan or add a page first.'); return; }
+  Job.addScans();
+  setMode('print');
+};
 $('saveBtn').onclick = () => save(false);
 $('saveNewBtn').onclick = () => save(true);
 
@@ -1757,6 +1981,7 @@ window.addEventListener('keydown', (e) => {
     if (autoTimer || autoRunning) { autoRunning = false; stopAuto(); }
     if (state.scanning) cancelScan();
     else if (state.cropping) finishCrop();
+    else if (state.picked.size) clearPicked();
     $('deviceMenu').hidden = true;
     return;
   }
@@ -1764,8 +1989,8 @@ window.addEventListener('keydown', (e) => {
   const onSelect = document.activeElement && document.activeElement.tagName === 'SELECT';
   if (onRange || onSelect) return;
   if (k === 'Enter' && state.cropping) { e.preventDefault(); finishCrop(); return; }
-  if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); removePage(state.current); return; }
-  if (k === 'r' || k === 'R') { rotate(e.shiftKey ? -1 : 1); return; }
+  if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); if (state.picked.size > 1) removePicked(); else removePage(state.current); return; }
+  if (k === 'r' || k === 'R') { if (state.picked.size > 1) turnPicked(e.shiftKey ? -1 : 1); else rotate(e.shiftKey ? -1 : 1); return; }
   if (k === 'c' || k === 'C') { state.cropping ? finishCrop() : startCrop(); return; }
   if (k === 'ArrowUp' || k === 'ArrowLeft') { e.preventDefault(); selectPage(state.current - 1); return; }
   if (k === 'ArrowDown' || k === 'ArrowRight') { e.preventDefault(); selectPage(state.current + 1); return; }

@@ -51,8 +51,8 @@ const Job = (() => {
     changed();
     return added;
   }
-  function addScans() {
-    const pages = state.pages.filter((p) => !p.dropped);
+  function addScans(list) {
+    const pages = (Array.isArray(list) ? list : state.pages).filter((p) => !p.dropped);
     if (!pages.length) { toast('No scans yet: switch to Scan (Ctrl+2) and scan some pages.'); return; }
     J.files.push(entry(`Scans (${plural(pages.length, 'page')})`, 'SCAN', pages.slice()));
     changed();
