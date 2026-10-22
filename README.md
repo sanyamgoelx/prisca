@@ -14,6 +14,7 @@ Printing and scanning for any printer, scanner or all-in-one on Windows (Pri + S
 ## Scan
 
 - **Space** scans the next page. Pages pile up in the batch on the left, already cropped and straightened.
+- The batch: page numbers sit on the pages, small marks show what you changed (B&W, cropped, turned, adjusted), hover a page to turn it, **Ctrl+click** or **Shift+click** to pick several and turn, print or remove them together, **Ctrl+scroll** for 1, 2 or 3 columns. The header shows roughly how big the file will be, and a page that looks like a second scan of another gets a *Same as 2?* badge.
 - Presets: Document (grey, 200 dpi), Receipt (black and white, 300 dpi), Photo (colour, 300 dpi). Resolution is adjustable.
 - Per page: colour mode, auto-enhance, brightness, contrast, sharpness, B&W threshold, turn, crop and straighten. **Apply to all pages** copies the settings.
 - Save as one PDF (searchable: Windows' own text recognition adds a hidden text layer; page size snaps to A4/Letter), or a JPG/PNG per page. Names like `Scan 2026-10-09 001`, saved in `Documents\Prisca` (changeable).
