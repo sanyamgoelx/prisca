@@ -627,6 +627,14 @@ function Do-Print($job) {
                 $g.ResetClip()
             } finally { $img.Dispose() }
         }
+        # Dashed lines to cut along (several receipts on one sheet).
+        $lines = @($sh.lines | Where-Object { $_ })
+        if ($lines.Count) {
+            $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(140, 140, 140)), ([single]0.25)
+            $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
+            foreach ($ln in $lines) { $g.DrawLine($pen, [single]($ln[0] - $hx), [single]($ln[1] - $hy), [single]($ln[2] - $hx), [single]($ln[3] - $hy)) }
+            $pen.Dispose()
+        }
         $script:PJ.i++
         $e.HasMorePages = $script:PJ.i -lt $script:PJ.sheets.Count
     })

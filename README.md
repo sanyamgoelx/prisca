@@ -6,6 +6,9 @@ Printing and scanning for any printer, scanner or all-in-one on Windows (Pri + S
 - **Print job**: add PDFs, pictures and your scans; pick pages from each (click pages, or All / None / Odd / Even), turn pages, reorder files, and print them all in one go. Each file starts on a new sheet, or runs on from the last. **Save as one PDF** keeps the picked pages as a file instead.
 - **Print again**: every printed job is kept (the last 20) with its pages and settings, to print again in one click.
 - **The printer's queue**: see what's waiting, cancel one job or all, spot stuck ones.
+- **Line up the printer** (under the printer name): Prisca prints a test page with five dots, you scan it back with Prisca (lid open), and it measures where the dots landed against the paper's edges. Every print on that printer is shifted back by that from then on. A guide walks you through it.
+- **Pack** (pages per sheet): several receipts, cards or tickets on one sheet at their real size, with dashed lines to cut along.
+- Drag page thumbnails to put pages in a different order, or onto another file to move them there.
 - Settings are shared with the print panel below (margins in mm, anchor, setups…).
 
 ## Scan

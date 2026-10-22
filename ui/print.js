@@ -27,7 +27,61 @@ const PrintLayout = (() => {
 
   // pages: [{ w, h } in mm, + anything else, passed through as item.page]
   // o: print options; paper: { w, h } mm (portrait); hard: { t, r, b, l } mm (portrait)
+  const PACK_GAP = 4; // mm between packed pages (where you cut)
+  // Several small pages (receipts, cards) at their real size, as many as fit, row by
+  // row in order, with dashed cut lines between them. The block sits at the anchor.
+  function packSheets(pages, o, paper, hard) {
+    const land = o.orient === 'land';
+    const P = { w: Math.min(paper.w, paper.h), h: Math.max(paper.w, paper.h) };
+    const pw = land ? P.h : P.w, ph = land ? P.w : P.h;
+    const m = o.m;
+    const area = { x: m.l, y: m.t, w: pw - m.l - m.r, h: ph - m.t - m.b };
+    const sc = o.mode === 'custom' ? o.pct / 100 : 1;
+    const ax = (o.anchor % 3) / 2, ay = Math.floor(o.anchor / 3) / 2;
+    const out = [];
+    let rows = [], row = null, y = 0, shrunk = 0;
+    const flush = () => {
+      if (!rows.length) return;
+      const bw = Math.max(...rows.map((r) => r.w)), bh = rows.reduce((s2, r, i) => s2 + r.h + (i ? PACK_GAP : 0), 0);
+      const ox = area.x + (area.w - bw) * ax + o.offX, oy = area.y + (area.h - bh) * ay + o.offY;
+      const items = [], lines = [];
+      let yy = 0;
+      rows.forEach((r, ri) => {
+        let xx = 0;
+        r.items.forEach((it, ii) => {
+          const x = ox + xx, yv = oy + yy;
+          items.push({ page: it.pg, scale: it.s, x, y: yv, w: it.w, h: it.h, clip: { x, y: yv, w: it.w, h: it.h }, anchor: null });
+          if (ii) lines.push([x - PACK_GAP / 2, oy + yy, x - PACK_GAP / 2, oy + yy + r.h]);
+          xx += it.w + PACK_GAP;
+        });
+        if (ri) lines.push([ox, oy + yy - PACK_GAP / 2, ox + bw, oy + yy - PACK_GAP / 2]);
+        yy += r.h + PACK_GAP;
+      });
+      // Cut lines around the whole block too.
+      const g = PACK_GAP / 2;
+      lines.push([ox - g, oy - g, ox + bw + g, oy - g], [ox - g, oy + bh + g, ox + bw + g, oy + bh + g], [ox - g, oy - g, ox - g, oy + bh + g], [ox + bw + g, oy - g, ox + bw + g, oy + bh + g]);
+      if (items.length) items[0].anchor = { x: area.x + area.w * ax + o.offX, y: area.y + area.h * ay + o.offY };
+      out.push({ landscape: land, pw, ph, hard: hardFor(hard, land), area, items, lines, packed: true, valid: area.w >= 5 && area.h >= 5 });
+      rows = []; row = null; y = 0;
+    };
+    for (const pg of pages) {
+      let s2 = sc, w = pg.w * s2, h = pg.h * s2;
+      // Bigger than the space inside the margins: just that page shrinks to fit.
+      if (w > area.w || h > area.h) { s2 = Math.min(area.w / pg.w, area.h / pg.h) * 0.999; w = pg.w * s2; h = pg.h * s2; shrunk++; }
+      if (row && row.w + PACK_GAP + w > area.w + 1e-6) { y += row.h + PACK_GAP; row = null; }
+      if (!row && y > 0 && y + h > area.h + 1e-6) flush();
+      if (!row) { row = { items: [], w: 0, h: 0 }; rows.push(row); }
+      row.items.push({ pg, s: s2, w, h });
+      row.w += (row.items.length > 1 ? PACK_GAP : 0) + w;
+      row.h = Math.max(row.h, h);
+    }
+    flush();
+    if (out.length) out[0].shrunk = shrunk;
+    return out;
+  }
+
   function sheets(pages, o, paper, hard) {
+    if (o.nup === 'pack') return packSheets(pages, o, paper, hard);
     const per = o.nup === 4 ? 4 : o.nup === 2 ? 2 : 1;
     const P = { w: Math.min(paper.w, paper.h), h: Math.max(paper.w, paper.h) };
     const out = [];
@@ -119,7 +173,7 @@ const PrintLayout = (() => {
     return { fronts, backs, copies: 1, paper: fronts.length, blanks };
   }
 
-  return { ANCHORS, GUTTER, sheets, check, parsePages, passes, hardFor };
+  return { ANCHORS, GUTTER, PACK_GAP, sheets, check, parsePages, passes, hardFor };
 })();
 
 // ---------- The panel ----------
@@ -135,6 +189,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
   const STARTERS = [
     { name: 'Receipt on A4', opts: { paper: 9, paperName: 'A4', orient: 'port', m: { t: 10, r: 10, b: 10, l: 10 }, linked: true, mode: 'actual', pct: 100, anchor: 1, nup: 1, ink: 'colour' } },
     { name: 'ID card copy', opts: { paper: 9, paperName: 'A4', orient: 'port', m: { t: 25, r: 10, b: 10, l: 10 }, linked: false, mode: 'actual', pct: 100, anchor: 1, nup: 1, ink: 'colour' } },
+    { name: 'Receipts packed', opts: { paper: 9, paperName: 'A4', orient: 'port', m: { t: 10, r: 10, b: 15, l: 10 }, linked: false, mode: 'actual', pct: 100, anchor: 0, nup: 'pack', ink: 'grey' } },
     { name: 'On letterhead', opts: { paper: 9, paperName: 'A4', orient: 'port', m: { t: 45, r: 20, b: 25, l: 20 }, linked: false, mode: 'fit', pct: 100, anchor: 1, nup: 1, ink: 'colour' } },
   ];
   const STATE_TEXT = { offline: 'Offline. Windows keeps the job until the printer is on.', nopaper: 'Windows says it’s out of paper.', jam: 'Windows says paper is jammed.', door: 'Windows says a cover is open.', error: 'Windows reports a problem with this printer.', printing: 'Printing something else right now.' };
@@ -148,7 +203,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     for (const k of ['t', 'r', 'b', 'l']) x.m[k] = Math.max(0, Math.min(200, num(x.m[k], 10)));
     if (!['auto', 'port', 'land'].includes(x.orient)) x.orient = 'auto';
     if (!['fit', 'fill', 'actual', 'custom'].includes(x.mode)) x.mode = 'fit';
-    if (![1, 2, 4].includes(x.nup)) x.nup = 1;
+    if (![1, 2, 4, 'pack'].includes(x.nup)) x.nup = 1;
     if (!['colour', 'grey', 'draft'].includes(x.ink)) x.ink = 'colour';
     x.pct = Math.max(10, Math.min(400, Math.round(num(x.pct, 100))));
     x.anchor = Math.max(0, Math.min(8, Math.round(num(x.anchor, 4))));
@@ -385,6 +440,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     seg('prBreak', store().fileBreak === 'flow' ? 'flow' : 'new');
     el('printPanel').classList.toggle('job', P.mode === 'job');
     renderQueue();
+    renderAlign();
     el('prDuplex').setAttribute('aria-checked', String(o.duplex));
     el('prDuplexNote').textContent = info && info.duplex
       ? 'This printer can print both sides itself, but Prisca turns the stack by hand: it prints the fronts, then shows how to put the stack back.'
@@ -407,8 +463,8 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
         ? `Print the fronts · ${pass.fronts.length} ${pass.fronts.length === 1 ? 'sheet' : 'sheets'}`
         : `Print ${pass.paper} ${pass.paper === 1 ? 'sheet' : 'sheets'}`;
       const pages = pl.sel.length;
-      el('prSub').textContent = `${pages} ${pages === 1 ? 'page' : 'pages'} · ${o.nup} per sheet · ${o.copies} ${o.copies === 1 ? 'copy' : 'copies'}${pass.oneSided ? ' · one sheet, so no backs' : o.duplex ? ` · both sides on ${pass.paper} ${pass.paper === 1 ? 'sheet' : 'sheets'}` : ''}`;
-      go.disabled = P.busy || !info || !P.printer || !pl.check.valid || !!P.step;
+      el('prSub').textContent = `${pages} ${pages === 1 ? 'page' : 'pages'} · ${o.nup === 'pack' ? 'packed' : `${o.nup} per sheet`} · ${o.copies} ${o.copies === 1 ? 'copy' : 'copies'}${pass.oneSided ? ' · one sheet, so no backs' : o.duplex ? ` · both sides on ${pass.paper} ${pass.paper === 1 ? 'sheet' : 'sheets'}` : ''}`;
+      go.disabled = P.busy || !info || !P.printer || !pl.check.valid || !!P.step || !!P.align;
     }
     el('prStep').hidden = !P.step;
     if (P.step) {
@@ -458,6 +514,10 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     const hd0 = hardOf(P.info);
     if (P.info) for (const [k, name] of [['t', 'top'], ['r', 'right'], ['b', 'bottom'], ['l', 'left']]) if (o.m[k] < hd0[k] - 0.05) small.push(`${name} ${r1(hd0[k])}`);
     if (small.length && c.lost <= 0.2) addWarn(`Some margins are smaller than this printer can print (${small.join(', ')} mm), but nothing on the page lands there.`, false);
+    if (o.nup === 'pack') {
+      const shrunk = pl.sheets.reduce((n, x) => n + (x.shrunk || 0), 0);
+      addWarn(shrunk ? `Packed at ${o.mode === 'custom' ? o.pct + '%' : 'true size'} with cut lines; ${shrunk} too big for the space ${shrunk === 1 ? 'was' : 'were'} made smaller to fit.` : `Packed at ${o.mode === 'custom' ? o.pct + '%' : 'true size'}, ${pl.sel.length} on ${pl.sheets.length} ${pl.sheets.length === 1 ? 'sheet' : 'sheets'}, with dashed lines to cut along. Fit and Fill don’t apply here.`, false);
+    }
     const pictures = pl.sel.some((s) => s.ref.picture);
     if ((o.mode === 'actual' || o.mode === 'custom') && pictures) addWarn('Added pictures have no real size; True size treats them as 200 dpi.', false);
     else if (o.mode === 'actual' && c.valid && c.lost <= 0.2 && c.trimmed <= 0.2) addWarn('True size: 1 cm on the original is 1 cm on paper.', false);
@@ -489,7 +549,15 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     box('pr-hard', 0, hd.t, hd.l, sh.ph - hd.t - hd.b);
     box('pr-hard', sh.pw - hd.r, hd.t, hd.r, sh.ph - hd.t - hd.b);
     box('pr-margin', sh.area.x + o.offX, sh.area.y + o.offY, sh.area.w, sh.area.h);
+    for (const ln of sh.lines || []) {
+      const [x1, y1, x2, y2] = ln;
+      const d = document.createElement('div');
+      d.className = y1 === y2 ? 'pr-cut h' : 'pr-cut v';
+      Object.assign(d.style, { left: px(Math.min(x1, x2)), top: px(Math.min(y1, y2)), width: px(Math.abs(x2 - x1)), height: px(Math.abs(y2 - y1)) });
+      sheetEl.appendChild(d);
+    }
     for (const it of sh.items) {
+      if (!it.anchor) continue;
       const d = document.createElement('div');
       d.className = 'pr-dot';
       Object.assign(d.style, { left: px(it.anchor.x), top: px(it.anchor.y) });
@@ -576,15 +644,24 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     }
     g.putImageData(img, 0, 0);
   }
-  function jobSheets(list, paths) {
-    return list.map((sh) => sh
-      ? { landscape: sh.landscape, items: sh.items.map((it) => ({ path: paths.get(it.page.ref).path, x: it.x, y: it.y, w: it.w, h: it.h, cx: it.clip.x, cy: it.clip.y, cw: it.clip.w, ch: it.clip.h })) }
-      : { landscape: false, items: [] });
+  // Each sheet as the helper draws it, shifted by this printer's measured offset (alignment check).
+  function jobSheets(list, paths, printer) {
+    const cal = calFor(printer);
+    return list.map((sh) => {
+      if (!sh) return { landscape: false, items: [], lines: [] };
+      const d = Align.shiftFor(cal, sh.landscape);
+      return {
+        landscape: sh.landscape,
+        items: sh.items.map((it) => ({ path: paths.get(it.page.ref).path, x: it.x + d.x, y: it.y + d.y, w: it.w, h: it.h, cx: it.clip.x + d.x, cy: it.clip.y + d.y, cw: it.clip.w, ch: it.clip.h })),
+        lines: (sh.lines || []).map(([x1, y1, x2, y2]) => [x1 + d.x, y1 + d.y, x2 + d.x, y2 + d.y]),
+      };
+    });
   }
+  const calFor = (printer) => (store().align && store().align[printer]) || null;
   async function send(printer, info, o, list, copies, paths, title) {
     const job = {
       printer, paper: o.paper, color: o.ink === 'colour' && !!info.color, draft: o.ink === 'draft',
-      copies, title: `Prisca ${title}`, sheets: jobSheets(list, paths),
+      copies, title: `Prisca ${title}`, sheets: jobSheets(list, paths, printer),
     };
     return Backend.print(job);
   }
@@ -603,20 +680,20 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     Job.record({ title, pages, sheets, printer, opts: clone(o) });
   }
 
-  async function run(list, o, printer, info, { closeAfter = true } = {}) {
+  async function run(list, o, printer, info, { closeAfter = true, test = false, title: forceTitle = '' } = {}) {
     const pl = plan(list, o, info);
     if (!pl) return false;
     if (!pl.check.valid) { toast('The margins leave no room for the page.', { bad: true }); return false; }
     const pass = PrintLayout.passes(pl.sheets, o.copies, o.duplex, o.reverse);
     P.busy = true; render();
     let paths = new Map();
-    const title = jobTitle(list);
+    const title = forceTitle || jobTitle(list);
     try {
       paths = await stagePages([pass.fronts, pass.backs], o.ink, 'Printing');
       toast(`Sending to ${printer}…`, { sticky: true });
       const r = await send(printer, info, o, pass.fronts, pass.copies, paths, title);
       const sent = (r && r.sheets) || pass.fronts.length;
-      keep(pl, paths, printer, o, pass.paper, title);
+      if (!test) keep(pl, paths, printer, o, pass.paper, title);
       if (o.duplex && pass.backs.length) {
         P.step = {
           backs: pass.backs, paths, printer, info, o: clone(o), title,
@@ -627,6 +704,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       }
       discardAll(paths);
       const copiesNote = pass.copies > 1 ? ` × ${pass.copies} copies` : '';
+      if (test) { $('toast').hidden = true; return true; }
       toast(`Sent ${sent} ${sent === 1 ? 'sheet' : 'sheets'}${copiesNote} to ${printer}.`, { action: 'Show the queue', onAction: () => { if (P.open) { P.queueOpen = true; loadQueue(); } } });
       if (closeAfter && P.mode === 'batch') close();
       else loadQueue();
@@ -714,6 +792,187 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
     P.opts = cleanOpts({ ...opts, duplex: opts.duplex, copies: opts.copies });
     if (P.info) { const size = matchPaper(P.info, P.opts); if (size && size.kind !== P.opts.paper) await usePaper(size.kind); }
     changed();
+  }
+
+  // ---------- Alignment check: a guided walk-through over the preview ----------
+  // Print a test page, scan it back, and Prisca corrects every print from then on.
+  // P.align: null, or { stage, paper, printer, before, result, error, confirm }
+  //   stage: 'intro' → 'printing' → 'printed' → 'place' → 'scanning' → 'done'
+  const GLASS_SVG = `<svg viewBox="0 0 290 200" width="290" height="200" aria-hidden="true">
+    <rect x="10" y="20" width="200" height="170" rx="6" fill="#0b0c0d" stroke="#3a3c42" stroke-width="2"/>
+    <text x="110" y="14" text-anchor="middle" font-size="10" fill="#8d8b85">scanner glass (lid open)</text>
+    <rect x="22" y="52" width="176" height="150" fill="#f4f1ea"/>
+    <circle cx="44" cy="74" r="5" fill="#2a2a2a"/><circle cx="58" cy="74" r="2.5" fill="#2a2a2a"/><circle cx="176" cy="74" r="5" fill="#2a2a2a"/>
+    <path d="M110 22v28" stroke="#f2b544" stroke-width="2" stroke-dasharray="3 3"/>
+    <path d="M104 28l6-6 6 6M104 44l6 6 6-6" stroke="#f2b544" stroke-width="2" fill="none"/>
+    <text x="118" y="40" font-size="11" fill="#f6d48d">about 2 cm</text>
+    <path d="M12 120h8" stroke="#f2b544" stroke-width="2"/>
+    <text x="216" y="104" font-size="10" fill="#a4a29c">a side</text><text x="216" y="116" font-size="10" fill="#a4a29c">edge clear</text>
+    <path d="M200 120h12" stroke="#f2b544" stroke-width="2"/>
+    <text x="110" y="140" text-anchor="middle" font-size="11" fill="#6b6a66">face down</text>
+  </svg>`;
+
+  function startAlign() {
+    if (!P.info) return;
+    const size = P.info.sizes.find((x) => x.kind === P.opts.paper) || { w: 210, h: 297, name: 'A4' };
+    P.align = { stage: 'intro', paper: { w: size.w, h: size.h, name: size.name }, printer: P.printer, confirm: false };
+    render();
+  }
+  function closeAlign() { P.align = null; render(); }
+  async function printTest() {
+    const a = P.align;
+    if (!a || P.busy) return;
+    a.stage = 'printing'; a.error = ''; render();
+    const canvas = Align.makePage(a.paper.w, a.paper.h, 300, a.printer);
+    const page = docPage(await createImageBitmap(canvas), 300);
+    canvas.width = canvas.height = 0;
+    // The page exactly as drawn: no margins, true size, from the paper's corner (plus the current correction).
+    const o = cleanOpts({ ...P.opts, m: { t: 0, r: 0, b: 0, l: 0 }, mode: 'actual', anchor: 0, offX: 0, offY: 0, nup: 1, orient: 'port', ink: 'grey', copies: 1, duplex: false });
+    a.before = calFor(a.printer) ? { ...calFor(a.printer) } : null;
+    const ok = await run([page], o, a.printer, P.info, { closeAfter: false, test: true, title: 'Alignment test page' });
+    if (P.align !== a) return;
+    a.stage = ok ? 'printed' : 'intro';
+    if (!ok) a.error = 'The test page didn’t go to the printer. Check it’s on and has paper, then try again.';
+    render();
+  }
+  async function scanTest() {
+    const a = P.align;
+    if (!a || P.busy) return;
+    a.stage = 'scanning'; a.error = '';
+    P.busy = true; render();
+    try {
+      const { bitmap, dpi } = await scanRaw(300, 'Scanning the test page. Don’t move it');
+      a.measuring = true; render();
+      await nextFrame();
+      const r = Align.analyse(bitmap, dpi, a.paper.w, a.paper.h);
+      if (bitmap.close) bitmap.close();
+      if (!r.ok) { a.stage = 'place'; a.error = r.reason; return; }
+      // The page was printed with the old correction; what's left over adds to it.
+      const b = a.before || { dx: 0, dy: 0 };
+      const cal = { dx: b.dx + r.dx, dy: b.dy + r.dy, skew: r.skew, at: Date.now(), paper: a.paper.name };
+      const st = store();
+      if (!st.align) st.align = {};
+      st.align[a.printer] = cal;
+      saveSettings();
+      a.result = { measured: r, cal };
+      a.stage = 'done';
+    } catch (e) {
+      a.stage = 'place';
+      a.error = e.error || 'Couldn’t scan the test page.';
+    } finally { a.measuring = false; P.busy = false; render(); }
+  }
+  function resetAlign() {
+    const st = store();
+    if (st.align) delete st.align[P.printer];
+    saveSettings();
+    P.align = null;
+    render();
+    toast(`${P.printer}: no alignment correction now.`);
+  }
+
+  // The status line under the printer, and the guide over the preview.
+  function renderAlign() {
+    const box = el('prAlign'), guide = el('prGuide');
+    if (!box || !guide) return;
+    box.innerHTML = '';
+    const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+    const button = (text, fn, cls = 'ghost') => { const b = mk('button', cls, text); b.onclick = fn; b.disabled = P.busy; return b; };
+    const a = P.align && P.align.printer === P.printer ? P.align : null;
+    if (P.printer) {
+      const cal = calFor(P.printer);
+      const line = mk('div', 'pr-align-line');
+      const date = cal ? new Date(cal.at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : '';
+      line.appendChild(mk('span', '', a ? 'Alignment check in progress: follow the steps on the left.'
+        : cal ? `Alignment corrected (${date}): prints landed ${Align.describe(cal.dx, cal.dy)}; Prisca shifts them back.`
+          : 'Alignment: not checked. Prints may sit a millimetre or two off.'));
+      if (!a) {
+        const links = mk('div', 'pr-align-links');
+        links.appendChild(button(cal ? 'Check again' : 'Check alignment', startAlign, 'pr-link'));
+        if (cal) links.appendChild(button('Turn off', resetAlign, 'pr-link'));
+        line.appendChild(links);
+      }
+      box.appendChild(line);
+    }
+    guide.hidden = !a;
+    guide.innerHTML = '';
+    if (!a) return;
+
+    const steps = [['Print', ['intro', 'printing', 'printed']], ['Place', ['place']], ['Scan', ['scanning']], ['Done', ['done']]];
+    const cur = steps.findIndex(([, st]) => st.includes(a.stage));
+    const head = mk('div', 'gd-head');
+    head.appendChild(mk('h2', '', 'Line up the printer'));
+    const bar = mk('ol', 'gd-steps');
+    steps.forEach(([label], i) => bar.appendChild(mk('li', i < cur ? 'done' : i === cur ? 'on' : '', `${i + 1} ${label}`)));
+    head.appendChild(bar);
+    const close = button('', closeAlign, 'gd-close');
+    close.setAttribute('aria-label', 'Close the alignment check');
+    close.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    head.appendChild(close);
+    guide.appendChild(head);
+
+    const body = mk('div', 'gd-body');
+    const text = (t, cls = 'gd-text') => body.appendChild(mk('p', cls, t));
+    const list = (items) => { const ul = mk('ul', 'gd-list'); for (const t of items) ul.appendChild(mk('li', '', t)); body.appendChild(ul); };
+    const actions = mk('div', 'gd-actions');
+    const scanner = state.devicesLoaded && currentDevice();
+    const name = a.printer;
+    switch (a.stage) {
+      case 'intro':
+        body.appendChild(mk('h3', '', `Prisca will find out exactly where ${name} puts things on the page.`));
+        text('Most printers print a millimetre or two off to one side. Prisca prints a test page with five dots, you scan it back, and Prisca measures how far off the dots landed against the paper’s edges. From then on every print is shifted back by that amount.');
+        list([`Put a plain sheet of ${a.paper.name} in the printer.`, scanner ? `Your scanner (${scanner.name}) needs to be on: it reads the page back.` : 'Switch your scanner on: it reads the page back.', 'It takes about a minute.']);
+        if (!scanner) text('No scanner found yet. You can print the test page now and scan it once the scanner is on.', 'gd-note');
+        actions.append(button('Print the test page', printTest, 'pr-go'), button('Not now', closeAlign));
+        break;
+      case 'printing':
+        body.appendChild(mk('h3', '', 'Printing the test page…'));
+        text(`Sending it to ${name}. Wait for the page to come out.`);
+        body.appendChild(mk('div', 'gd-spin'));
+        break;
+      case 'printed':
+        body.appendChild(mk('h3', '', 'Take the page out of the printer.'));
+        text('It has four big dots near the corners, one small dot beside the top-left one, and a ruler in the middle.');
+        list(['Missing a dot or smudged? Print it again.', 'Nothing came out? Check the printer’s lights and paper, then print again.']);
+        actions.append(button('It’s out, next', () => { a.stage = 'place'; render(); }, 'pr-go'), button('Print it again', printTest));
+        break;
+      case 'place': {
+        body.appendChild(mk('h3', '', 'Put it on the scanner like this.'));
+        const row = mk('div', 'gd-place');
+        const pic = mk('div', 'gd-pic');
+        pic.innerHTML = GLASS_SVG;
+        const how = mk('ol', 'gd-how');
+        for (const t of ['Face down on the glass. Any way round is fine.', 'Slide it about 2 cm away from the top edge of the glass (or the bottom), so the paper’s edge shows.', 'Keep one side edge off the glass edge too.', 'Leave the lid open: the dark around the paper lets Prisca see its edges.']) how.appendChild(mk('li', '', t));
+        row.append(pic, how);
+        body.appendChild(row);
+        if (a.error) { const e = mk('div', 'gd-error'); e.appendChild(mk('strong', '', 'That didn’t work. ')); e.appendChild(document.createTextNode(a.error)); body.appendChild(e); }
+        if (!scanner) text('No scanner found. Switch it on; Prisca notices on its own.', 'gd-note');
+        const go = button(a.error ? 'Scan again' : 'Scan the test page', scanTest, 'pr-go');
+        go.disabled = P.busy || !scanner;
+        actions.append(go, button('Back', () => { a.stage = 'printed'; a.error = ''; render(); }));
+        break;
+      }
+      case 'scanning':
+        body.appendChild(mk('h3', '', a.measuring ? 'Measuring…' : 'Scanning the test page…'));
+        text(a.measuring ? 'Finding the dots and the paper’s edges.' : 'Don’t move the page or close the lid until it’s done.');
+        body.appendChild(mk('div', 'gd-spin'));
+        break;
+      case 'done': {
+        const m = a.result.measured, c = a.result.cal;
+        const small = Math.abs(m.dx) < 0.3 && Math.abs(m.dy) < 0.3;
+        body.appendChild(mk('h3', '', a.confirm ? (small ? 'Spot on. The correction works.' : 'Nearly there: one more adjustment made.') : 'Done. Prisca has lined up this printer.'));
+        const big = mk('div', 'gd-result');
+        big.appendChild(mk('span', 'gd-num', Align.describe(m.dx, m.dy)));
+        big.appendChild(mk('span', '', a.confirm ? 'off on this check' : `is where ${name} printed`));
+        body.appendChild(big);
+        text(`From now on every print on ${name} is shifted back by ${Align.describe(c.dx, c.dy)}. You don’t need to do anything else.`);
+        if (Math.abs(m.skew) > 0.4) text(`The paper also went in ${Align.fmt(Math.abs(m.skew))}° crooked. Push the printer’s paper guide gently against the stack.`, 'gd-note');
+        if (!a.confirm && !small) text('Want proof? Check it worked: Prisca prints and scans the test page once more; it should come out within 0.3 mm.');
+        actions.append(button('Done', closeAlign, 'pr-go'));
+        if (!small || !a.confirm) actions.append(button('Check it worked', () => { a.confirm = true; a.stage = 'intro'; printTest(); }));
+        break;
+      }
+    }
+    guide.append(body, actions);
   }
 
   // ---------- The printer's queue (what Windows is holding) ----------
@@ -812,7 +1071,7 @@ const PrintPanel = typeof document === 'undefined' ? null : (() => {
       el(id).addEventListener('click', (e) => {
         const b = e.target.closest('button');
         if (!b) return;
-        P.opts[key] = key === 'nup' ? Number(b.dataset.v) : b.dataset.v;
+        P.opts[key] = key === 'nup' ? (b.dataset.v === 'pack' ? 'pack' : Number(b.dataset.v)) : b.dataset.v;
         P.sheet = 0;
         changed({ keepProfile: key === 'ink' });
       });

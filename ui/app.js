@@ -133,6 +133,7 @@ async function loadDevices() {
   }
   renderDevice();
   updateScanBar();
+  if (window.PrintPanel) PrintPanel.refresh();
   // No scanner yet: keep looking quietly, so switching the printer on is enough.
   clearTimeout(devicePoll);
   if (!state.devices.length && Backend.inApp) devicePoll = setTimeout(quietRecheck, 4000);
@@ -148,6 +149,7 @@ async function quietRecheck() {
       if (!list.some((d) => d.id === settings.deviceId)) { settings.deviceId = list[0].id; saveSettings(); }
       renderDevice();
       updateScanBar();
+      if (window.PrintPanel) PrintPanel.refresh();
       toast(`${currentDevice().name} is ready.`);
       return;
     }
@@ -876,6 +878,36 @@ function updateScanBar() {
 }
 
 let scanClock = null, lastError = null;
+// A plain grey flatbed scan for Prisca's own use (the alignment check): not added to the batch.
+async function scanRaw(dpi, label) {
+  if (state.scanning || state.saving) throw { code: 'busy', error: 'The scanner is busy. Wait for it to finish.' };
+  const d = currentDevice();
+  if (!d) throw { code: 'notfound', error: 'No scanner found. Check it is on and connected.' };
+  stopAuto();
+  state.scanning = true;
+  renderDevice();
+  updateScanBar();
+  const started = Date.now();
+  toast(`${label}…`, { sticky: true });
+  const tick = setInterval(() => toast(`${label}… ${Math.round((Date.now() - started) / 1000)} s`, { sticky: true }), 1000);
+  clearTimeout(releaseTimer);
+  try {
+    const r = await Backend.scan({ device: d.id, deviceName: d.name, dpi, intent: 'grey', source: 'flatbed' });
+    if (!r.pages.length) throw { code: 'empty', error: 'The scanner sent no pages.' };
+    const pg = r.pages[0];
+    const bytes = await Backend.readFile(pg.path);
+    Backend.discard(pg.path);
+    return { bitmap: await createImageBitmap(new Blob([bytes])), dpi: pg.dpi || r.dpi || dpi };
+  } finally {
+    clearInterval(tick);
+    $('toast').hidden = true;
+    state.scanning = false;
+    renderDevice();
+    updateScanBar();
+    releaseTimer = setTimeout(() => Backend.releaseScanner(), 120000);
+  }
+}
+
 async function scan({ replace = null, copy = false } = {}) {
   if (state.scanning || state.saving) return;
   stopAuto();

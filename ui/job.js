@@ -77,6 +77,77 @@ const Job = (() => {
     changed();
     toast('Print job cleared.', { action: 'Undo', onAction: () => { J.files = old; changed(); } });
   }
+  // Moves page i of file `from` to position `at` in file `to` (pages, picks and turns travel together).
+  function movePage(from, i, to, at) {
+    if (from === to && (at === i || at === i + 1)) return;
+    const pg = from.pages.splice(i, 1)[0], pk = from.picked.splice(i, 1)[0], tn = from.turns.splice(i, 1)[0];
+    if (from === to && at > i) at--;
+    to.pages.splice(at, 0, pg); to.picked.splice(at, 0, pk); to.turns.splice(at, 0, tn);
+    if (!from.pages.length) J.files.splice(J.files.indexOf(from), 1);
+    if (from !== to) { to.open = true; toast(`Moved page to ${to.name}.`); }
+    changed();
+  }
+
+  // Drag a page thumbnail: drop it between pages to reorder, or on another file to move it there.
+  // Pointer events, because Windows blocks normal drag and drop in Prisca's window.
+  let drag = null;
+  function startDrag(e, f, i, tile) {
+    if (e.button !== 0) return;
+    drag = { f, i, tile, x0: e.clientX, y0: e.clientY, on: false, ghost: null, target: null };
+    window.addEventListener('pointermove', dragMove);
+    window.addEventListener('pointerup', dragEnd, { once: true });
+  }
+  function dropTarget(x, y) {
+    const under = document.elementFromPoint(x, y);
+    if (!under) return null;
+    const t = under.closest('.job-page');
+    if (t && t.dataset.file) {
+      const f = J.files.find((q) => String(q.id) === t.dataset.file);
+      const r = t.getBoundingClientRect();
+      const idx = Number(t.dataset.index) + (x > r.left + r.width / 2 ? 1 : 0);
+      return f ? { f, at: idx, el: t, after: x > r.left + r.width / 2 } : null;
+    }
+    const card = under.closest('.job-card');
+    if (card && card.dataset.file) {
+      const f = J.files.find((q) => String(q.id) === card.dataset.file);
+      return f ? { f, at: f.pages.length, el: card, card: true } : null;
+    }
+    return null;
+  }
+  function dragMove(e) {
+    if (!drag) return;
+    if (!drag.on) {
+      if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 6) return;
+      drag.on = true;
+      const img = drag.tile.querySelector('img');
+      const g = document.createElement('img');
+      g.className = 'job-ghost';
+      g.src = img ? img.src : '';
+      g.alt = '';
+      document.body.appendChild(g);
+      drag.ghost = g;
+      drag.tile.classList.add('dragging');
+    }
+    drag.ghost.style.left = `${e.clientX - 30}px`;
+    drag.ghost.style.top = `${e.clientY - 40}px`;
+    for (const x of document.querySelectorAll('.drop-before, .drop-after, .drop-card')) x.classList.remove('drop-before', 'drop-after', 'drop-card');
+    drag.target = dropTarget(e.clientX, e.clientY);
+    if (drag.target) drag.target.el.classList.add(drag.target.card ? 'drop-card' : drag.target.after ? 'drop-after' : 'drop-before');
+  }
+  function dragEnd() {
+    window.removeEventListener('pointermove', dragMove);
+    const d = drag;
+    drag = null;
+    if (!d || !d.on) return;
+    // Swallow the click that follows the drag.
+    const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+    window.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+    if (d.ghost) d.ghost.remove();
+    for (const x of document.querySelectorAll('.drop-before, .drop-after, .drop-card, .dragging')) x.classList.remove('drop-before', 'drop-after', 'drop-card', 'dragging');
+    if (d.target) movePage(d.f, d.i, d.target.f, d.target.at);
+  }
+
   function move(f, d) {
     const i = J.files.indexOf(f), j = i + d;
     if (i < 0 || j < 0 || j >= J.files.length) return;
@@ -166,11 +237,13 @@ const Job = (() => {
       const count = f.picked.filter(Boolean).length;
       const card = document.createElement('div');
       card.className = 'job-card' + (count ? '' : ' none');
+      card.dataset.file = String(f.id);
       const top = document.createElement('div');
       top.className = 'job-top';
       const th = document.createElement('img');
       th.className = 'job-thumb';
       th.alt = '';
+      th.draggable = false;
       th.src = thumb(f.pages[0], f.turns[0]);
       const info = document.createElement('div');
       info.className = 'job-info';
@@ -213,10 +286,13 @@ const Job = (() => {
         f.pages.forEach((pg, i) => {
           const tile = document.createElement('div');
           tile.className = 'job-page' + (f.picked[i] ? ' on' : '');
+          tile.dataset.file = String(f.id);
+          tile.dataset.index = String(i);
           const pick = btn('job-pick', '', `${f.picked[i] ? 'Leave out' : 'Include'} page ${i + 1} of ${f.name}`, () => { f.picked[i] = !f.picked[i]; changed(); });
           const im = document.createElement('img');
           im.alt = '';
           im.loading = 'lazy';
+          im.draggable = false;
           im.src = thumb(pg, f.turns[i]);
           pick.appendChild(im);
           const num = document.createElement('span');
@@ -227,6 +303,9 @@ const Job = (() => {
           pick.appendChild(tick);
           const turn = btn('job-turn', '', `Turn page ${i + 1} a quarter turn`, () => { f.turns[i] = (f.turns[i] + 1) % 4; changed(); }, ICON.turn);
           tile.append(pick, turn);
+          pick.addEventListener('pointerdown', (e) => startDrag(e, f, i, tile));
+          pick.addEventListener('dragstart', (e) => e.preventDefault());
+          pick.title += ' · drag to move it';
           grid.appendChild(tile);
         });
         card.append(quick, grid);

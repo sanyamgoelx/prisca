@@ -101,4 +101,18 @@ t('both sides by hand', () => {
   assert.strictEqual(plain.paper, 6); assert.strictEqual(plain.copies, 2);
 });
 
+t('pack: real size, rows, cut lines, new sheet when full', () => {
+  const receipts = Array.from({ length: 7 }, (_, i) => ({ w: 80, h: 150 + (i % 3) * 20 }));
+  const out = L.sheets(receipts, { ...base, nup: 'pack', mode: 'actual', anchor: 0 }, A4, none);
+  assert.strictEqual(out.length, 4);
+  assert.deepStrictEqual(out.map((s) => s.items.length), [2, 2, 2, 1]);
+  const [a, b] = out[0].items;
+  near(a.w, 80, 'true size'); near(a.x, 10, 'top-left anchor'); near(b.x, 10 + 80 + L.PACK_GAP, 'gap between');
+  assert.ok(out[0].lines.length >= 5, 'cut lines');
+  const cards = L.sheets(Array(10).fill({ w: 85.6, h: 54 }), { ...base, nup: 'pack', mode: 'actual', anchor: 0 }, A4, none);
+  assert.deepStrictEqual(cards.map((s) => s.items.length), [8, 2]); // 2 across, 4 down inside 10 mm margins
+  const big = L.sheets([{ w: 300, h: 400 }], { ...base, nup: 'pack', mode: 'actual' }, A4, none);
+  assert.strictEqual(big[0].shrunk, 1); assert.ok(big[0].items[0].w <= 190 + 1e-6);
+});
+
 console.log(`${n} print layout checks passed`);
